@@ -147,7 +147,7 @@ check_pid() {
     return 1
 }
 
-# 启动应用
+# 启动单个应用实例
 start() {
     local instance_name="$1"
     
@@ -167,24 +167,92 @@ start() {
     echo "=> 日志目录: $LOG_DIR"
     echo "=> 控制台日志: $LOG_FILE"
     
-    # 使用 nohup 启动并将日志重定向到日志文件，同时在后台运行
-    nohup java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar $APP_JAR > "$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
+    # 使用 nohup 启动并将日志追加到日志文件，同时在后台运行
+    nohup java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar $APP_JAR >> "$LOG_FILE" 2>&1 &
+    local java_pid=$!
+    echo $java_pid > "$PID_FILE"
     
     # 检查启动状态
     sleep 2
-    pid=$(check_pid)
-    if [ -n "$pid" ]; then
-        echo "=> $APP_NAME 实例 '$instance_name' 启动成功! (pid: $pid)"
+    if kill -0 $java_pid 2>/dev/null; then
+        echo "=> $APP_NAME 实例 '$instance_name' 启动成功! (pid: $java_pid)"
         echo "=> 控制台日志输出到: $LOG_FILE"
         echo "=> 应用日志输出到: $LOG_DIR"
+        return 0
     else
         echo "=> $APP_NAME 实例 '$instance_name' 启动失败，请检查日志: $LOG_FILE"
-        exit 1
+        return 1
     fi
 }
 
-# 停止应用
+# 启动所有实例
+start_all() {
+    declare -A servers
+    declare -a server_keys
+    local success_count=0
+    local total_count=0
+    
+    # 加载服务器配置
+    if [ -f "$SERVERS_CONFIG" ]; then
+        while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            servers["$key"]="$value"
+            server_keys+=("$key")
+        done < "$SERVERS_CONFIG"
+    fi
+    
+    # 如果没有配置文件，使用默认配置
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers["server"]=""
+        server_keys=("server")
+    fi
+    
+    echo "=> 开始启动所有实例..."
+    echo "=> 发现 ${#server_keys[@]} 个实例"
+    echo ""
+    
+    # 逐个启动实例
+    for instance_name in "${server_keys[@]}"; do
+        total_count=$((total_count + 1))
+        echo "[$total_count/${#server_keys[@]}] 启动实例: $instance_name"
+        
+        # 在子shell中启动实例，避免变量污染和PID混乱
+        (
+            if start "$instance_name"; then
+                exit 0
+            else
+                exit 1
+            fi
+        )
+        
+        if [ $? -eq 0 ]; then
+            success_count=$((success_count + 1))
+            echo "✓ 实例 '$instance_name' 启动成功"
+        else
+            echo "✗ 实例 '$instance_name' 启动失败"
+        fi
+        echo ""
+        
+        # 实例间启动间隔，避免资源竞争
+        if [ $total_count -lt ${#server_keys[@]} ]; then
+            sleep 3
+        fi
+    done
+    
+    echo "=> 启动完成: $success_count/$total_count 个实例启动成功"
+    
+    if [ $success_count -eq $total_count ]; then
+        echo "=> 所有实例启动成功!"
+        return 0
+    else
+        echo "=> 部分实例启动失败，请检查日志"
+        return 1
+    fi
+}
+
+# 停止单个应用实例
 stop() {
     local instance_name="$1"
     
@@ -217,14 +285,163 @@ stop() {
     kill -9 $pid
     rm -f "$PID_FILE"
     echo "=> $APP_NAME 实例 '$instance_name' 已被强制停止"
+    return 0
 }
 
-# 重启应用
+# 停止所有实例
+stop_all() {
+    declare -A servers
+    declare -a server_keys
+    local success_count=0
+    local total_count=0
+    
+    # 加载服务器配置
+    if [ -f "$SERVERS_CONFIG" ]; then
+        while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            servers["$key"]="$value"
+            server_keys+=("$key")
+        done < "$SERVERS_CONFIG"
+    fi
+    
+    # 如果没有配置文件，使用默认配置
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers["server"]=""
+        server_keys=("server")
+    fi
+    
+    echo "=> 开始停止所有实例..."
+    echo "=> 发现 ${#server_keys[@]} 个实例"
+    echo ""
+    
+    # 逐个停止实例
+    for instance_name in "${server_keys[@]}"; do
+        total_count=$((total_count + 1))
+        echo "[$total_count/${#server_keys[@]}] 停止实例: $instance_name"
+        
+        # 在子shell中停止实例，避免变量污染
+        (
+            if stop "$instance_name"; then
+                exit 0
+            else
+                exit 1
+            fi
+        )
+        
+        if [ $? -eq 0 ]; then
+            success_count=$((success_count + 1))
+            echo "✓ 实例 '$instance_name' 停止成功"
+        else
+            echo "✗ 实例 '$instance_name' 停止失败"
+        fi
+        echo ""
+    done
+    
+    echo "=> 停止完成: $success_count/$total_count 个实例停止成功"
+    
+    if [ $success_count -eq $total_count ]; then
+        echo "=> 所有实例停止成功!"
+        return 0
+    else
+        echo "=> 部分实例停止失败"
+        return 1
+    fi
+}
+
+# 重启单个应用实例
 restart() {
     local instance_name="$1"
     stop "$instance_name"
     sleep 2
     start "$instance_name"
+}
+
+# 滚动重启所有实例（保障业务连续性）
+restart_all() {
+    declare -A servers
+    declare -a server_keys
+    local success_count=0
+    local total_count=0
+    
+    # 加载服务器配置
+    if [ -f "$SERVERS_CONFIG" ]; then
+        while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            servers["$key"]="$value"
+            server_keys+=("$key")
+        done < "$SERVERS_CONFIG"
+    fi
+    
+    # 如果没有配置文件，使用默认配置
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers["server"]=""
+        server_keys=("server")
+    fi
+    
+    echo "=> 开始滚动重启所有实例（保障业务连续性）..."
+    echo "=> 发现 ${#server_keys[@]} 个实例"
+    echo "=> 策略：逐个重启，如有失败则停止后续重启"
+    echo ""
+    
+    # 逐个滚动重启实例
+    for instance_name in "${server_keys[@]}"; do
+        total_count=$((total_count + 1))
+        echo "[$total_count/${#server_keys[@]}] 滚动重启实例: $instance_name"
+        echo ""
+        
+        # 在子shell中重启实例，避免变量污染
+        (
+            echo "  => 步骤1: 停止实例 $instance_name"
+            if stop "$instance_name"; then
+                echo "  => 步骤2: 等待 3 秒后启动实例 $instance_name"
+                sleep 3
+                if start "$instance_name"; then
+                    echo "  => 实例 $instance_name 重启成功"
+                    exit 0
+                else
+                    echo "  => 实例 $instance_name 启动失败"
+                    exit 1
+                fi
+            else
+                echo "  => 实例 $instance_name 停止失败"
+                exit 1
+            fi
+        )
+        
+        if [ $? -eq 0 ]; then
+            success_count=$((success_count + 1))
+            echo "✓ 实例 '$instance_name' 滚动重启成功"
+            
+            # 重启成功后等待一段时间，确保服务稳定后再重启下一个
+            if [ $total_count -lt ${#server_keys[@]} ]; then
+                echo "  => 等待 10 秒确保服务稳定，然后重启下一个实例..."
+                sleep 10
+            fi
+        else
+            echo "✗ 实例 '$instance_name' 滚动重启失败"
+            echo ""
+            echo "=> 检测到重启失败，为保障业务连续性，停止后续实例的重启操作"
+            echo "=> 已成功重启: $success_count 个实例"
+            echo "=> 失败位置: 第 $total_count 个实例 ($instance_name)"
+            echo "=> 建议: 请检查失败实例的日志，修复问题后手动重启剩余实例"
+            return 1
+        fi
+        echo ""
+    done
+    
+    echo "=> 滚动重启完成: $success_count/$total_count 个实例重启成功"
+    
+    if [ $success_count -eq $total_count ]; then
+        echo "=> 所有实例滚动重启成功! 业务连续性得到保障"
+        return 0
+    else
+        echo "=> 部分实例重启失败"
+        return 1
+    fi
 }
 
 # 检查应用状态
@@ -382,25 +599,117 @@ get_instance_choice() {
     done
 }
 
+# 检查所有实例状态
+status_all() {
+    declare -A servers
+    declare -a server_keys
+    local running_count=0
+    local total_count=0
+    
+    # 加载服务器配置
+    if [ -f "$SERVERS_CONFIG" ]; then
+        while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            servers["$key"]="$value"
+            server_keys+=("$key")
+        done < "$SERVERS_CONFIG"
+    fi
+    
+    # 如果没有配置文件，使用默认配置
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers["server"]=""
+        server_keys=("server")
+    fi
+    
+    echo "=> 检查所有实例状态..."
+    echo "=> 发现 ${#server_keys[@]} 个实例"
+    echo ""
+    
+    # 逐个检查实例状态
+    for instance_name in "${server_keys[@]}"; do
+        total_count=$((total_count + 1))
+        echo "[$total_count/${#server_keys[@]}] 实例: $instance_name"
+        
+        # 在子shell中检查状态，避免变量污染
+        (
+            if get_instance_config "$instance_name"; then
+                pid=$(check_pid)
+                if [ -n "$pid" ]; then
+                    echo "  状态: 运行中 (pid: $pid)"
+                    echo "  目录: $APP_RUNTIME_HOME"
+                    exit 0
+                else
+                    echo "  状态: 未运行"
+                    exit 1
+                fi
+            else
+                echo "  状态: 配置错误"
+                exit 1
+            fi
+        )
+        
+        if [ $? -eq 0 ]; then
+            running_count=$((running_count + 1))
+            echo "  ✓ 正常运行"
+        else
+            echo "  ✗ 未运行"
+        fi
+        echo ""
+    done
+    
+    echo "=> 状态汇总: $running_count/$total_count 个实例正在运行"
+    
+    if [ $running_count -eq $total_count ]; then
+        echo "=> 所有实例都在运行!"
+        return 0
+    elif [ $running_count -eq 0 ]; then
+        echo "=> 所有实例都未运行"
+        return 1
+    else
+        echo "=> 部分实例在运行"
+        return 1
+    fi
+}
+
 # 执行对应的操作
 execute_command() {
     local cmd="$1"
     local instance="$2"
     
-    case "$cmd" in
-        start)
-            start "$instance"
-            ;;
-        stop)
-            stop "$instance"
-            ;;
-        restart)
-            restart "$instance"
-            ;;
-        status)
-            status "$instance"
-            ;;
-    esac
+    # 检查是否是 all 操作
+    if [ "$instance" = "all" ]; then
+        case "$cmd" in
+            start)
+                start_all
+                ;;
+            stop)
+                stop_all
+                ;;
+            restart)
+                restart_all
+                ;;
+            status)
+                status_all
+                ;;
+        esac
+    else
+        case "$cmd" in
+            start)
+                start "$instance"
+                ;;
+            stop)
+                stop "$instance"
+                ;;
+            restart)
+                restart "$instance"
+                ;;
+            status)
+                status "$instance"
+                ;;
+        esac
+    fi
 }
 
 # 主逻辑
@@ -434,7 +743,7 @@ main() {
         command=$(validate_command "$1")
         if [ $? -ne 0 ]; then
             echo "错误: 无效的命令 '$1'"
-            echo "用法: $0 {start|stop|restart|status} [实例名]"
+            echo "用法: $0 {start|stop|restart|status} [实例名|all]"
             exit 1
         fi
     elif [ $# -eq 2 ]; then
@@ -442,12 +751,12 @@ main() {
         command=$(validate_command "$1")
         if [ $? -ne 0 ]; then
             echo "错误: 无效的命令 '$1'"
-            echo "用法: $0 {start|stop|restart|status} [实例名]"
+            echo "用法: $0 {start|stop|restart|status} [实例名|all]"
             exit 1
         fi
         instance="$2"
     else
-        echo "用法: $0 {start|stop|restart|status} [实例名]"
+        echo "用法: $0 {start|stop|restart|status} [实例名|all]"
         exit 1
     fi
     
@@ -462,7 +771,11 @@ main() {
         fi
     fi
     
-    echo "执行命令: $command $instance"
+    if [ "$instance" = "all" ]; then
+        echo "执行命令: $command all"
+    else
+        echo "执行命令: $command $instance"
+    fi
     echo ""
     execute_command "$command" "$instance"
 }
