@@ -1,227 +1,472 @@
 #!/bin/bash
 #
-# 生产环境应用启动脚本
-# 使用方法: ./startup.sh [start|stop|restart|status]
+# 生产环境应用启动脚本 - 支持多实例部署
+# 使用方法: ./startup.sh [start|stop|restart|status] [实例名]
 #
 
 # 获取应用根目录（脚本所在目录的上一级）
 APP_HOME=$(cd "$(dirname "$0")"/.. && pwd)
-#APP_NAME="nipis-gj-transfer-0.1.4"
 APP_NAME="nipis-gj-transfer-0.2.0-SNAPSHOT"
 APP_JAR="${APP_HOME}/${APP_NAME}.jar"
-PID_FILE="${APP_HOME}/bin/${APP_NAME}.pid"
-LOG_DIR="${APP_HOME}/logs"
-LOG_FILE="${LOG_DIR}/${APP_NAME}.out"
+ALL_LOG_DIR="${APP_HOME}/logs"
+SERVERS_CONFIG="${APP_HOME}/servers.properties"
 
-# 创建日志目录（如果不存在）
-mkdir -p $LOG_DIR
+# 创建全局日志目录（如果不存在）
+mkdir -p $ALL_LOG_DIR
 
-# JVM 参数配置
-JAVA_OPTS="-server \
-    -Xms2g -Xmx4g \
-    -XX:PermSize=256m -XX:MaxPermSize=512m \
-    -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:InitiatingHeapOccupancyPercent=45 \
-    -XX:G1HeapRegionSize=16m -XX:+ParallelRefProcEnabled \
-    -XX:+UseStringDeduplication \
-    -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=\${LOGS_DIR}/heapdump.hprof \
-    -XX:ErrorFile=\${LOG_DIR}/hs_err_pid%p.log \
-    -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:${LOGS_DIR}/gc.log \
-    -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=5 -XX:GCLogFileSize=20m \
-    -XX:+DisableExplicitGC \
-    -Djson.defaultWriterFeatures=LargeObject"
+# 加载多实例配置
+load_servers_config() {
+    declare -A servers
+    if [ -f "$SERVERS_CONFIG" ]; then
+        while IFS='=' read -r key value; do
+            # 跳过空行和注释行
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            # 去除前后空格
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            servers["$key"]="$value"
+        done < "$SERVERS_CONFIG"
+    fi
+    
+    # 如果没有配置文件或配置为空，使用默认配置
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers["server"]=""
+    fi
+    
+    # 输出服务器配置（用于调试）
+    for key in "${!servers[@]}"; do
+        echo "$key=${servers[$key]}"
+    done
+}
 
-# 应用配置选项
-CONFIG_OPTS="-Dspring.config.location=file:${APP_HOME}/appconfig/application-prod.yml -Dlogging.config=${APP_HOME}/appconfig/logback-spring.xml"
+# 获取实例配置
+get_instance_config() {
+    local instance_name="$1"
+    declare -A servers
+    
+    if [ -f "$SERVERS_CONFIG" ]; then
+        while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            servers["$key"]="$value"
+        done < "$SERVERS_CONFIG"
+    fi
+    
+    # 如果没有配置文件，使用默认配置
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers["server"]=""
+    fi
+    
+    # 检查实例是否存在
+    if [[ -n "${servers[$instance_name]}" ]] || [[ "$instance_name" == "server" && -z "${servers[$instance_name]}" ]]; then
+        local instance_dir="${servers[$instance_name]}"
+        if [ -z "$instance_dir" ]; then
+            APP_RUNTIME_HOME="$APP_HOME"
+        else
+            APP_RUNTIME_HOME="$APP_HOME/$instance_dir"
+        fi
+        
+        # 设置实例相关变量
+        PID_FILE="${APP_RUNTIME_HOME}/${instance_name}.pid"
+        LOG_DIR="${APP_RUNTIME_HOME}/logs"
+        LOG_FILE="${ALL_LOG_DIR}/${APP_NAME}.out"
+        
+        # 创建实例日志目录
+        mkdir -p "$LOG_DIR"
+        
+        # 设置配置选项
+        setup_config_opts
+        setup_loader_opts
+        setup_java_opts
+        
+        return 0
+    else
+        return 1
+    fi
+}
 
-# Spring Boot Loader 配置
-LOADER_OPTS="-Dloader.path=${APP_HOME}/config/,${APP_HOME}/lib/"
+# 设置配置选项
+setup_config_opts() {
+    local runtime_config="${APP_RUNTIME_HOME}/appconfig/"
+    local app_config="${APP_HOME}/appconfig/"
+    
+    # 设置活动配置文件
+    ACTIVE_PROFILE="prod"
+    CONFIG_OPTS="-Dspring.profiles.active=${ACTIVE_PROFILE}"
+    
+    if [ -d "$runtime_config" ]; then
+        CONFIG_OPTS="$CONFIG_OPTS -Dspring.config.location=file:${runtime_config}"
+        if [ -f "${runtime_config}logback-spring.xml" ]; then
+            CONFIG_OPTS="$CONFIG_OPTS -Dlogging.config=${runtime_config}logback-spring.xml"
+        elif [ -f "${app_config}logback-spring.xml" ]; then
+            CONFIG_OPTS="$CONFIG_OPTS -Dlogging.config=${app_config}logback-spring.xml"
+        fi
+    elif [ -d "$app_config" ]; then
+        CONFIG_OPTS="$CONFIG_OPTS -Dspring.config.location=file:${app_config}"
+        if [ -f "${app_config}logback-spring.xml" ]; then
+            CONFIG_OPTS="$CONFIG_OPTS -Dlogging.config=${app_config}logback-spring.xml"
+        fi
+    fi
+}
+
+# 设置Loader选项
+setup_loader_opts() {
+    LOADER_OPTS="-Dloader.path=${APP_RUNTIME_HOME}/config/,${APP_HOME}/config/,${APP_HOME}/lib/"
+}
+
+# 设置JVM参数（在获取实例配置后调用）
+setup_java_opts() {
+    JAVA_OPTS="-server \
+        -Xms2g -Xmx4g \
+        -XX:PermSize=256m -XX:MaxPermSize=512m \
+        -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:InitiatingHeapOccupancyPercent=45 \
+        -XX:G1HeapRegionSize=16m -XX:+ParallelRefProcEnabled \
+        -XX:+UseStringDeduplication \
+        -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${LOG_DIR}/heapdump.hprof \
+        -XX:ErrorFile=${LOG_DIR}/hs_err_pid%p.log \
+        -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:${LOG_DIR}/gc.log \
+        -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=5 -XX:GCLogFileSize=20m \
+        -XX:+DisableExplicitGC \
+        -Djson.defaultWriterFeatures=LargeObject \
+        -DLOG_HOME=${LOG_DIR} \
+        -Dlogging.file.path=${LOG_DIR} \
+        -Duser.dir=${APP_RUNTIME_HOME}"
+}
 
 # 检查应用是否运行
 check_pid() {
-  if [ -f "$PID_FILE" ]; then
-    local pid=$(cat "$PID_FILE")
-    if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
-      echo $pid
-      return 0
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE")
+        if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
+            echo $pid
+            return 0
+        fi
     fi
-  fi
-  echo ""
-  return 1
+    echo ""
+    return 1
 }
 
 # 启动应用
 start() {
-  pid=$(check_pid)
-  if [ -n "$pid" ]; then
-    echo "=> $APP_NAME 已在运行中! (pid: $pid)"
-    return 0
-  fi
+    local instance_name="$1"
+    
+    if ! get_instance_config "$instance_name"; then
+        echo "=> 错误: 实例 '$instance_name' 不存在"
+        return 1
+    fi
+    
+    pid=$(check_pid)
+    if [ -n "$pid" ]; then
+        echo "=> $APP_NAME 实例 '$instance_name' 已在运行中! (pid: $pid)"
+        return 0
+    fi
 
-  echo "=> 正在启动 $APP_NAME..."
-  # 使用 nohup 启动并将日志重定向到日志文件，同时在后台运行
-  nohup java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar $APP_JAR > "$LOG_FILE" 2>&1 &
-  echo $! > "$PID_FILE"
-  
-  # 检查启动状态
-  sleep 2
-  pid=$(check_pid)
-  if [ -n "$pid" ]; then
-    echo "=> $APP_NAME 启动成功! (pid: $pid)"
-    echo "=> 日志输出到: $LOG_FILE"
-  else
-    echo "=> $APP_NAME 启动失败，请检查日志: $LOG_FILE"
-    exit 1
-  fi
+    echo "=> 正在启动 $APP_NAME 实例 '$instance_name'..."
+    echo "=> 运行目录: $APP_RUNTIME_HOME"
+    echo "=> 日志目录: $LOG_DIR"
+    echo "=> 控制台日志: $LOG_FILE"
+    
+    # 使用 nohup 启动并将日志重定向到日志文件，同时在后台运行
+    nohup java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar $APP_JAR > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    
+    # 检查启动状态
+    sleep 2
+    pid=$(check_pid)
+    if [ -n "$pid" ]; then
+        echo "=> $APP_NAME 实例 '$instance_name' 启动成功! (pid: $pid)"
+        echo "=> 控制台日志输出到: $LOG_FILE"
+        echo "=> 应用日志输出到: $LOG_DIR"
+    else
+        echo "=> $APP_NAME 实例 '$instance_name' 启动失败，请检查日志: $LOG_FILE"
+        exit 1
+    fi
 }
 
 # 停止应用
 stop() {
-  pid=$(check_pid)
-  if [ -z "$pid" ]; then
-    echo "=> $APP_NAME 未运行"
-    return 0
-  fi
-  
-  echo "=> 正在停止 $APP_NAME (pid: $pid)..."
-  kill $pid
-  
-  # 等待进程终止
-  for ((i=1; i<=30; i++)); do
-    if ! kill -0 $pid 2>/dev/null; then
-      rm -f "$PID_FILE"
-      echo "=> $APP_NAME 已停止"
-      return 0
+    local instance_name="$1"
+    
+    if ! get_instance_config "$instance_name"; then
+        echo "=> 错误: 实例 '$instance_name' 不存在"
+        return 1
     fi
-    sleep 1
-  done
-  
-  # 如果进程仍然存在，使用强制终止
-  echo "=> $APP_NAME 未能正常停止，正在强制终止..."
-  kill -9 $pid
-  rm -f "$PID_FILE"
-  echo "=> $APP_NAME 已被强制停止"
+    
+    pid=$(check_pid)
+    if [ -z "$pid" ]; then
+        echo "=> $APP_NAME 实例 '$instance_name' 未运行"
+        return 0
+    fi
+    
+    echo "=> 正在停止 $APP_NAME 实例 '$instance_name' (pid: $pid)..."
+    kill $pid
+    
+    # 等待进程终止
+    for ((i=1; i<=30; i++)); do
+        if ! kill -0 $pid 2>/dev/null; then
+            rm -f "$PID_FILE"
+            echo "=> $APP_NAME 实例 '$instance_name' 已停止"
+            return 0
+        fi
+        sleep 1
+    done
+    
+    # 如果进程仍然存在，使用强制终止
+    echo "=> $APP_NAME 实例 '$instance_name' 未能正常停止，正在强制终止..."
+    kill -9 $pid
+    rm -f "$PID_FILE"
+    echo "=> $APP_NAME 实例 '$instance_name' 已被强制停止"
 }
 
 # 重启应用
 restart() {
-  stop
-  sleep 2
-  start
+    local instance_name="$1"
+    stop "$instance_name"
+    sleep 2
+    start "$instance_name"
 }
 
 # 检查应用状态
 status() {
-  pid=$(check_pid)
-  if [ -n "$pid" ]; then
-    echo "=> $APP_NAME 正在运行 (pid: $pid)"
-    echo "=> 进程信息:"
-    ps -f -p $pid
-    echo "=> 日志文件: $LOG_FILE"
-  else
-    echo "=> $APP_NAME 未运行"
-  fi
+    local instance_name="$1"
+    
+    if ! get_instance_config "$instance_name"; then
+        echo "=> 错误: 实例 '$instance_name' 不存在"
+        return 1
+    fi
+    
+    pid=$(check_pid)
+    if [ -n "$pid" ]; then
+        echo "=> $APP_NAME 实例 '$instance_name' 正在运行 (pid: $pid)"
+        echo "=> 运行目录: $APP_RUNTIME_HOME"
+        echo "=> 进程信息:"
+        ps -f -p $pid
+        echo "=> 控制台日志文件: $LOG_FILE"
+        echo "=> 应用日志目录: $LOG_DIR"
+    else
+        echo "=> $APP_NAME 实例 '$instance_name' 未运行"
+    fi
 }
 
-# 显示菜单并获取用户输入
-show_menu() {
-  echo "请选择操作："
-  echo "1. start   - 启动应用"
-  echo "2. stop    - 停止应用"
-  echo "3. restart - 重启应用"
-  echo "4. status  - 查看状态"
-  echo ""
-  echo "请输入命令名称或对应数字 (start/stop/restart/status 或 1/2/3/4):"
+# 显示可用实例列表
+show_instances() {
+    echo "可用的实例:"
+    declare -A servers
+    
+    if [ -f "$SERVERS_CONFIG" ]; then
+        while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            servers["$key"]="$value"
+        done < "$SERVERS_CONFIG"
+    fi
+    
+    # 如果没有配置文件，使用默认配置
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers["server"]=""
+    fi
+    
+    local count=1
+    for key in "${!servers[@]}"; do
+        local dir="${servers[$key]}"
+        if [ -z "$dir" ]; then
+            dir="$APP_HOME (默认)"
+        else
+            dir="$APP_HOME/$dir"
+        fi
+        echo "$count. $key -> $dir"
+        ((count++))
+    done
 }
 
-# 验证用户输入
-validate_input() {
-  local input="$1"
-  case "$input" in
-    start|1)
-      echo "start"
-      return 0
-      ;;
-    stop|2)
-      echo "stop"
-      return 0
-      ;;
-    restart|3)
-      echo "restart"
-      return 0
-      ;;
-    status|4)
-      echo "status"
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+# 显示命令菜单
+show_command_menu() {
+    echo "请选择操作："
+    echo "1. start   - 启动应用"
+    echo "2. stop    - 停止应用"
+    echo "3. restart - 重启应用"
+    echo "4. status  - 查看状态"
+    echo ""
+    echo "请输入命令名称或对应数字 (start/stop/restart/status 或 1/2/3/4):"
+}
+
+# 验证命令输入
+validate_command() {
+    local input="$1"
+    case "$input" in
+        start|1)
+            echo "start"
+            return 0
+            ;;
+        stop|2)
+            echo "stop"
+            return 0
+            ;;
+        restart|3)
+            echo "restart"
+            return 0
+            ;;
+        status|4)
+            echo "status"
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 获取实例选择
+get_instance_choice() {
+    declare -A servers
+    declare -a server_keys
+    
+    if [ -f "$SERVERS_CONFIG" ]; then
+        while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            servers["$key"]="$value"
+            server_keys+=("$key")
+        done < "$SERVERS_CONFIG"
+    fi
+    
+    # 如果没有配置文件，使用默认配置
+    if [ ${#servers[@]} -eq 0 ]; then
+        servers["server"]=""
+        server_keys=("server")
+    fi
+    
+    # 如果只有一个实例，直接返回
+    if [ ${#server_keys[@]} -eq 1 ]; then
+        echo "${server_keys[0]}"
+        return 0
+    fi
+    
+    # 显示实例选择菜单
+    echo ""
+    echo "请选择要操作的实例:"
+    show_instances
+    echo ""
+    echo "请输入实例名称或对应数字:"
+    
+    while true; do
+        read -r user_input
+        
+        if [ -z "$user_input" ]; then
+            echo "输入不能为空，请重新选择。"
+            continue
+        fi
+        
+        # 检查是否是数字选择
+        if [[ "$user_input" =~ ^[0-9]+$ ]]; then
+            local index=$((user_input - 1))
+            if [ $index -ge 0 ] && [ $index -lt ${#server_keys[@]} ]; then
+                echo "${server_keys[$index]}"
+                return 0
+            else
+                echo "数字选择超出范围，请重新选择。"
+                continue
+            fi
+        fi
+        
+        # 检查是否是实例名称
+        if [[ -n "${servers[$user_input]}" ]]; then
+            echo "$user_input"
+            return 0
+        else
+            echo "实例 '$user_input' 不存在，请重新选择。"
+        fi
+    done
 }
 
 # 执行对应的操作
 execute_command() {
-  local cmd="$1"
-  case "$cmd" in
-    start)
-      start
-      ;;
-    stop)
-      stop
-      ;;
-    restart)
-      restart
-      ;;
-    status)
-      status
-      ;;
-  esac
+    local cmd="$1"
+    local instance="$2"
+    
+    case "$cmd" in
+        start)
+            start "$instance"
+            ;;
+        stop)
+            stop "$instance"
+            ;;
+        restart)
+            restart "$instance"
+            ;;
+        status)
+            status "$instance"
+            ;;
+    esac
 }
 
 # 主逻辑
-if [ $# -eq 0 ]; then
-  # 没有提供参数，显示交互式菜单
-  while true; do
-    show_menu
-    read -r user_input
+main() {
+    local command=""
+    local instance=""
     
-    if [ -z "$user_input" ]; then
-      echo "输入不能为空，请重新选择。"
-      echo ""
-      continue
-    fi
-    
-    validated_cmd=$(validate_input "$user_input")
-    if [ $? -eq 0 ]; then
-      echo "执行命令: $validated_cmd"
-      echo ""
-      execute_command "$validated_cmd"
-      break
+    # 处理命令参数
+    if [ $# -eq 0 ]; then
+        # 没有提供参数，显示命令菜单
+        while true; do
+            show_command_menu
+            read -r user_input
+            
+            if [ -z "$user_input" ]; then
+                echo "输入不能为空，请重新选择。"
+                echo ""
+                continue
+            fi
+            
+            command=$(validate_command "$user_input")
+            if [ $? -eq 0 ]; then
+                break
+            else
+                echo "选择错误，请重新选择。"
+                echo ""
+            fi
+        done
+    elif [ $# -eq 1 ]; then
+        # 只提供了命令参数
+        command=$(validate_command "$1")
+        if [ $? -ne 0 ]; then
+            echo "错误: 无效的命令 '$1'"
+            echo "用法: $0 {start|stop|restart|status} [实例名]"
+            exit 1
+        fi
+    elif [ $# -eq 2 ]; then
+        # 提供了命令和实例参数
+        command=$(validate_command "$1")
+        if [ $? -ne 0 ]; then
+            echo "错误: 无效的命令 '$1'"
+            echo "用法: $0 {start|stop|restart|status} [实例名]"
+            exit 1
+        fi
+        instance="$2"
     else
-      echo "选择错误，请重新选择。"
-      echo ""
+        echo "用法: $0 {start|stop|restart|status} [实例名]"
+        exit 1
     fi
-  done
-else
-  # 提供了参数，按原来的方式处理
-  case "$1" in
-    start)
-      start
-      ;;
-    stop)
-      stop
-      ;;
-    restart)
-      restart
-      ;;
-    status)
-      status
-      ;;
-    *)
-      echo "用法: $0 {start|stop|restart|status}"
-      exit 1
-      ;;
-  esac
-fi
+    
+    # 处理实例参数
+    if [ -z "$instance" ]; then
+        # 检查是否存在servers.properties文件
+        if [ -f "$SERVERS_CONFIG" ]; then
+            instance=$(get_instance_choice)
+        else
+            # 没有配置文件，使用默认实例
+            instance="server"
+        fi
+    fi
+    
+    echo "执行命令: $command $instance"
+    echo ""
+    execute_command "$command" "$instance"
+}
 
+# 运行主函数
+main "$@"
 exit 0
