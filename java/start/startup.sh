@@ -68,7 +68,7 @@ get_instance_config() {
         fi
         
         # 设置实例相关变量
-        PID_FILE="${APP_RUNTIME_HOME}/${instance_name}.pid"
+        PID_FILE="${APP_RUNTIME_HOME}/.app.pid"
         LOG_DIR="${APP_RUNTIME_HOME}/logs"
         LOG_FILE="${ALL_LOG_DIR}/${APP_NAME}.out"
         
