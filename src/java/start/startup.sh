@@ -6,6 +6,9 @@
 
 # 获取应用根目录（脚本所在目录的上一级）
 APP_HOME=$(cd "$(dirname "$0")"/.. && pwd)
+
+# 补丁类路径，用于存放覆盖jar文件中需要打补丁的class
+PATCH_CLASSPATH="$APP_HOME/patch_classpath"
 APP_NAME="nipis-gj-transfer-0.2.0-SNAPSHOT"
 APP_JAR="${APP_HOME}/${APP_NAME}.jar"
 ALL_LOG_DIR="${APP_HOME}/logs"
@@ -112,7 +115,7 @@ setup_config_opts() {
 
 # 设置Loader选项
 setup_loader_opts() {
-    LOADER_OPTS="-Dloader.path=${APP_RUNTIME_HOME}/config/,${APP_HOME}/config/,${APP_HOME}/lib/"
+    LOADER_OPTS="-Dloader.path=${PATCH_CLASSPATH},${APP_RUNTIME_HOME}/config/,${APP_HOME}/config/,${APP_HOME}/lib/"
 }
 
 # 设置JVM参数（在获取实例配置后调用）
