@@ -150,6 +150,67 @@ check_pid() {
     return 1
 }
 
+# 检查Spring Boot应用启动状态
+check_spring_boot_startup() {
+    local instance_name="$1"
+    local java_pid="$2"
+    local max_wait_time=60  # 最大等待时间60秒
+    local check_interval=2  # 每2秒检查一次
+    local waited_time=0
+    
+    echo "=> 等待Spring Boot应用启动完成..."
+    
+    while [ $waited_time -lt $max_wait_time ]; do
+        # 首先检查进程是否还存在
+        if ! kill -0 $java_pid 2>/dev/null; then
+            echo "=> 警告: 进程 $java_pid 已停止"
+            rm -f "$PID_FILE"
+            return 1
+        fi
+        
+        # 检查日志文件是否存在
+        if [ -f "$LOG_FILE" ]; then
+            # 检查是否有启动成功的标识
+            if grep -q "Started.*in.*seconds" "$LOG_FILE" 2>/dev/null; then
+                echo "=> Spring Boot应用启动成功! (用时: ${waited_time}秒)"
+                return 0
+            fi
+            
+            # 检查是否有应用关闭的标识
+            if grep -qE "(Stopping|Shutdown|Application shutdown|Shutting down|stopped in|Closing)" "$LOG_FILE" 2>/dev/null; then
+                echo "=> 警告: 检测到应用关闭信号，启动失败"
+                rm -f "$PID_FILE"
+                return 1
+            fi
+            
+            # 检查是否有严重错误
+            if grep -qE "(Exception|Error.*startup|Failed to start|Unable to start|startup failed)" "$LOG_FILE" 2>/dev/null; then
+                echo "=> 警告: 检测到启动错误"
+                rm -f "$PID_FILE"
+                return 1
+            fi
+        fi
+        
+        sleep $check_interval
+        waited_time=$((waited_time + check_interval))
+        echo "=> 等待中... (${waited_time}/${max_wait_time}秒)"
+    done
+    
+    # 超时检查
+    echo "=> 超时: 等待${max_wait_time}秒后仍未检测到启动完成标识"
+    echo "=> 进程状态检查..."
+    
+    if kill -0 $java_pid 2>/dev/null; then
+        echo "=> 警告: 进程仍在运行但未检测到启动完成，可能启动异常"
+        echo "=> 建议检查日志: $LOG_FILE 和 $LOG_DIR"
+        return 1
+    else
+        echo "=> 进程已停止，启动失败"
+        rm -f "$PID_FILE"
+        return 1
+    fi
+}
+
 # 启动单个应用实例
 start() {
     local instance_name="$1"
@@ -170,20 +231,33 @@ start() {
     echo "=> 日志目录: $LOG_DIR"
     echo "=> 控制台日志: $LOG_FILE"
     
+    # 清空或创建日志文件，确保检查的是当前启动的日志
+    > "$LOG_FILE"
+    
     # 使用 nohup 启动并将日志追加到日志文件，同时在后台运行
     nohup java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar $APP_JAR >> "$LOG_FILE" 2>&1 &
     local java_pid=$!
     echo $java_pid > "$PID_FILE"
     
-    # 检查启动状态
+    # 基础进程检查
     sleep 2
-    if kill -0 $java_pid 2>/dev/null; then
+    if ! kill -0 $java_pid 2>/dev/null; then
+        echo "=> $APP_NAME 实例 '$instance_name' 进程启动失败"
+        rm -f "$PID_FILE"
+        echo "=> 请检查日志: $LOG_FILE"
+        return 1
+    fi
+    
+    # Spring Boot启动状态检查
+    if check_spring_boot_startup "$instance_name" "$java_pid"; then
         echo "=> $APP_NAME 实例 '$instance_name' 启动成功! (pid: $java_pid)"
         echo "=> 控制台日志输出到: $LOG_FILE"
         echo "=> 应用日志输出到: $LOG_DIR"
         return 0
     else
-        echo "=> $APP_NAME 实例 '$instance_name' 启动失败，请检查日志: $LOG_FILE"
+        echo "=> $APP_NAME 实例 '$instance_name' 启动失败"
+        echo "=> 请检查日志: $LOG_FILE 和 $LOG_DIR"
+        # PID文件已在check_spring_boot_startup中清理
         return 1
     fi
 }
@@ -427,10 +501,23 @@ restart_all() {
         else
             echo "✗ 实例 '$instance_name' 滚动重启失败"
             echo ""
-            echo "=> 检测到重启失败，为保障业务连续性，停止后续实例的重启操作"
+            echo "⚠️  警告: 检测到重启失败，为保障业务连续性，立即终止滚动重启过程"
             echo "=> 已成功重启: $success_count 个实例"
             echo "=> 失败位置: 第 $total_count 个实例 ($instance_name)"
-            echo "=> 建议: 请检查失败实例的日志，修复问题后手动重启剩余实例"
+            echo "=> 剩余未重启: $((${#server_keys[@]} - total_count)) 个实例"
+            echo ""
+            echo "🛡️  保护措施: 保持其他正在运行的实例不受影响"
+            echo "📋 建议操作:"
+            echo "   1. 检查失败实例的日志文件"
+            echo "   2. 修复启动问题"
+            echo "   3. 手动重启失败的实例: $0 restart $instance_name"
+            echo "   4. 确认修复后，可继续重启剩余实例"
+            echo ""
+            echo "📁 关键日志位置:"
+            if get_instance_config "$instance_name"; then
+                echo "   - 控制台日志: $LOG_FILE"
+                echo "   - 应用日志: $LOG_DIR"
+            fi
             return 1
         fi
         echo ""
@@ -765,19 +852,68 @@ main() {
     
     # 处理实例参数
     if [ -z "$instance" ]; then
+        echo ""
+        echo "请选择要操作的实例 (直接按回车默认选择 all - 所有实例):"
+        
         # 检查是否存在servers.properties文件
         if [ -f "$SERVERS_CONFIG" ]; then
-            instance=$(get_instance_choice)
+            # 显示实例选择菜单
+            show_instances
+            echo ""
+            echo "输入选项:"
+            echo "- 实例名称或对应数字"
+            echo "- 'all' 或直接按回车 - 操作所有实例"
+            echo ""
+            echo "请输入选择:"
+            
+            read -r user_input
+            
+            # 如果用户直接按回车或输入 all，则操作所有实例
+            if [ -z "$user_input" ] || [ "$user_input" = "all" ]; then
+                instance="all"
+            else
+                # 处理用户输入
+                declare -A servers
+                declare -a server_keys
+                
+                while IFS='=' read -r key value; do
+                    [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+                    key=$(echo "$key" | xargs)
+                    value=$(echo "$value" | xargs)
+                    servers["$key"]="$value"
+                    server_keys+=("$key")
+                done < "$SERVERS_CONFIG"
+                
+                # 检查是否是数字选择
+                if [[ "$user_input" =~ ^[0-9]+$ ]]; then
+                    local index=$((user_input - 1))
+                    if [ $index -ge 0 ] && [ $index -lt ${#server_keys[@]} ]; then
+                        instance="${server_keys[$index]}"
+                    else
+                        echo "数字选择超出范围，默认操作所有实例。"
+                        instance="all"
+                    fi
+                elif [[ -n "${servers[$user_input]}" ]]; then
+                    # 是有效的实例名称
+                    instance="$user_input"
+                else
+                    echo "实例 '$user_input' 不存在，默认操作所有实例。"
+                    instance="all"
+                fi
+            fi
         else
-            # 没有配置文件，使用默认实例
+            # 没有配置文件，单实例运行
+            echo "未找到 servers.properties 配置文件"
+            echo "=> 单实例运行，直接开始执行第1步骤选择的操作"
             instance="server"
         fi
     fi
     
+    echo ""
     if [ "$instance" = "all" ]; then
-        echo "执行命令: $command all"
+        echo "=> 即将执行命令: $command (所有实例)"
     else
-        echo "执行命令: $command $instance"
+        echo "=> 即将执行命令: $command (实例: $instance)"
     fi
     echo ""
     execute_command "$command" "$instance"
