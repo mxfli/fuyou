@@ -22,7 +22,7 @@
 
 ### 📊 状态监控
 
-- **实时检查**: 能够检查单个或所有实例的运行状态，包括进程ID和资源使用情况
+- **实时检查**: 能够检查单个或所有实例的运行状态，包括进程ID和进程信息
 - **启动状态**: 基于Spring Boot日志的准确启动状态判断
 - **详细诊断**: 失败时提供完整的故障信息和恢复建议
 - **日志管理**: 自动创建日志目录，并将控制台输出和GC日志分别重定向到指定文件
@@ -35,16 +35,17 @@
 /your/app/root/
 ├── src/
 │   └── java/
-│       ├── appconfig/              # (可选) 实例独立的配置文件目录
-│       ├── lib/                    # (可选) 外部依赖库
-│       ├── logs/                   # 全局日志目录
+│       ├── appconfig/              # (可选) 应用/默认实例的配置目录；实例可在各自运行目录下提供 appconfig/
+│       ├── lib/                    # (可选) 外部依赖库（由 loader.path 使用）
+│       ├── logs/                   # 默认实例的日志目录；多实例时各实例使用其运行目录下的 logs/
 │       ├── your-app.jar            # Spring Boot 可执行 Jar 包
 │       ├── servers.properties      # (可选) 多实例配置文件
 │       └── start/
-│           └── startup.sh          # 启动脚本
+│           ├── startup.sh          # 启动脚本
+│           └── jvm-env.sh          # (可选) 外置 JVM 参数配置（全局）
 ├── instance1/                  # (可选) 实例1的运行时目录
-│   ├── appconfig/
-│   └── logs/
+│   ├── appconfig/              # (可选) 实例级配置
+│   └── logs/                   # 实例级日志目录
 └── instance2/                  # (可选) 实例2的运行时目录
     ├── appconfig/
     └── logs/
@@ -52,6 +53,7 @@
 
 - **`src/java/`**: 应用的主目录。
 - **`src/java/start/startup.sh`**: 启动脚本。
+- **`src/java/start/jvm-env.sh`**: 外置 JVM 参数配置（可选，全局生效）。
 - **`src/java/servers.properties`**: 多实例配置文件。如果不存在，脚本将作为单实例运行。
 - **`instance1/`, `instance2/`**: 实例的运行时目录，在 `servers.properties` 中定义。
 
@@ -71,9 +73,8 @@ api=api-server
 
 # worker 实例在 src/java/worker-server/ 目录下运行
 worker=worker-server
-
-# default 实例在主目录 src/java/ 下运行
-default=
+# server 实例在主目录 src/java/ 下运行
+server=
 ```
 
 ## 4. 使用方法
@@ -275,8 +276,8 @@ start
 **问题**: Spring Boot应用启动失败
 - **现象**: 脚本显示"启动失败，请检查日志"
 - **排查**: 
-  1. 检查应用日志: `tail -f logs/{instance_name}/nohup.out`
-  2. 查找关键错误信息: `grep -E "(Exception|Error|Failed)" logs/{instance_name}/nohup.out`
+    1. 检查控制台日志: `tail -f <运行目录>/logs/<应用名>.out`
+    2. 查找关键错误信息: `grep -E "(Exception|Error.*startup|Failed to start|Unable to start)" <运行目录>/logs/<应用名>.out`
 - **常见原因**:
   - 端口冲突: 修改 `servers.properties` 中的端口配置
   - 配置错误: 检查 Spring Boot 配置文件
@@ -352,30 +353,30 @@ bash -x ./startup.sh start api
 
 ### 9.1 日志文件
 
-- **控制台日志**: `logs/{instance_name}/nohup.out` - 标准输出和错误输出
-- **应用日志**: `logs/{instance_name}/*.log` - Spring Boot 应用日志
-- **GC 日志**: `logs/{instance_name}/gc.log` - JVM 垃圾回收日志
+- **控制台日志**: `<运行目录>/logs/<应用名>.out` - 标准输出和错误输出
+- **应用日志**: `<运行目录>/logs/*.log` - Spring Boot 应用日志
+- **GC 日志**: `<运行目录>/logs/gc.log` - JVM 垃圾回收日志
 
 ### 9.2 配置和状态文件
 
 - **实例配置**: `servers.properties` - 多实例配置
-- **PID 文件**: `logs/{instance_name}/.app.pid` - 进程ID文件
+- **PID 文件**: `<运行目录>/.app.pid` - 进程ID文件
 - **启动脚本**: `startup.sh` - 主控制脚本
 
 ### 9.3 日志查看命令
 
 ```bash
-# 实时查看应用日志
-tail -f logs/{instance_name}/nohup.out
+# 实时查看控制台日志（每个实例）
+tail -f <运行目录>/logs/<应用名>.out
 
-# 查看启动相关日志
-grep "Started.*in.*seconds" logs/{instance_name}/nohup.out
+# 查看启动成功标识
+grep "Started.*in.*seconds" <运行目录>/logs/<应用名>.out
 
-# 查看错误日志
-grep -E "(Exception|Error|Failed)" logs/{instance_name}/nohup.out
+# 查看错误日志（启动失败常见关键字）
+grep -E "(Exception|Error.*startup|Failed to start|Unable to start)" <运行目录>/logs/<应用名>.out
 
-# 查看最近的日志
-tail -100 logs/{instance_name}/nohup.out
+# 查看最近的控制台日志
+tail -100 <运行目录>/logs/<应用名>.out
 ```
 
 ## 10. 最佳实践
@@ -393,3 +394,38 @@ tail -100 logs/{instance_name}/nohup.out
 2. **健康检查**: 重启后验证应用功能正常性
 3. **回滚准备**: 准备快速回滚方案
 4. **文档维护**: 保持运维文档和配置同步更新
+
+## 11. 外置 JVM 参数配置（jvm-env.sh）
+
+为便于生产环境灵活调优，脚本支持通过外置 Shell 配置文件覆盖 JVM 可调参数。
+
+- 配置文件位置：
+    - 与 startup.sh 同目录：`src/java/start/jvm-env.sh`（全局生效）
+- 支持 JDK 版本：JDK 8/11/17/21/25
+    - **JDK 8**：自动使用 PermGen + 旧式 GC 日志（`-Xloggc`、`-XX:+PrintGCDetails`）
+    - **JDK 11/17/21/25**：自动使用 Metaspace + 新式 GC 日志（`-Xlog:gc*`）
+    - 脚本会自动检测 JDK 主版本并应用对应参数集，无需手动区分
+- 变量清单（示例仅供参考，具体请查看模板文件）：
+    - `JVM_XMS`、`JVM_XMX`：堆最小/最大（建议一致）
+    - `JVM_METASPACE_SIZE`、`JVM_MAX_METASPACE_SIZE`：元空间初始/最大（JDK 11+ 使用）
+    - `JVM_PERM_SIZE`、`JVM_MAX_PERM_SIZE`：永久代初始/最大（仅 JDK 8 使用）
+    - `JVM_MAX_GC_PAUSE_MS`：期望最大 GC 暂停时间（毫秒）
+    - `JVM_IHOP`：G1 初始标记触发阈值（百分比）
+    - `JVM_GC_LOG_FILESIZE`、`JVM_GC_LOG_FILECOUNT`：GC 日志轮转
+    - `JVM_THREAD_STACK_SIZE`：线程栈大小（可选）
+    - `JVM_HEAP_DUMP_PATH`、`JVM_ERROR_FILE`：OOM/错误日志路径
+    - `EXTRA_JAVA_OPTS`：追加自定义 JVM 参数
+
+推荐做法：
+
+- 小型服务：`JVM_XMS=2g`、`JVM_XMX=2g~4g`、`JVM_MAX_GC_PAUSE_MS=200`、`JVM_IHOP=45`
+- 中型服务：`JVM_XMS=4g~8g`、`JVM_XMX=4g~8g`、`JVM_MAX_GC_PAUSE_MS=150~200`
+- 大堆应用：可在 `EXTRA_JAVA_OPTS` 中开启 `-XX:+AlwaysPreTouch`（启动更慢但运行更稳）
+- JDK 8 永久代：默认 `JVM_PERM_SIZE=256m`、`JVM_MAX_PERM_SIZE=512m`
+- JDK 11+ 元空间：默认 `JVM_METASPACE_SIZE=128m`、`JVM_MAX_METASPACE_SIZE=512m`
+
+说明：
+
+- startup.sh 会自动检测 JDK 主版本并选择推荐参数集。
+- JDK 8 使用 PermGen 与旧式 GC 日志；JDK 11+ 使用 Metaspace 与新式 `-Xlog` 日志。
+- 若未提供 `jvm-env.sh`，脚本会使用内置的安全默认值。

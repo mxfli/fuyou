@@ -11,82 +11,77 @@ APP_HOME=$(cd "$(dirname "$0")"/.. && pwd)
 PATCH_CLASSPATH="$APP_HOME/patch_classpath"
 APP_NAME="nipis-gj-transfer-0.2.0-SNAPSHOT"
 APP_JAR="${APP_HOME}/${APP_NAME}.jar"
-ALL_LOG_DIR="${APP_HOME}/logs"
 SERVERS_CONFIG="${APP_HOME}/servers.properties"
 
-# 创建全局日志目录（如果不存在）
-mkdir -p $ALL_LOG_DIR
+# 读取多实例配置（无副作用，保持文件顺序）
+read_servers_ordered() {
+    # 有序数组（与 servers.properties 行顺序一致）
+    SERVER_KEYS=()
+    SERVER_DIRS=()
 
-# 加载多实例配置
-load_servers_config() {
-    declare -A servers
     if [ -f "$SERVERS_CONFIG" ]; then
         while IFS='=' read -r key value; do
-            # 跳过空行和注释行
+            # 跳过空行和注释
             [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
             # 去除前后空格
             key=$(echo "$key" | xargs)
             value=$(echo "$value" | xargs)
-            servers["$key"]="$value"
+            SERVER_KEYS+=("$key")
+            SERVER_DIRS+=("$value")
         done < "$SERVERS_CONFIG"
     fi
-    
-    # 如果没有配置文件或配置为空，使用默认配置
-    if [ ${#servers[@]} -eq 0 ]; then
-        servers["server"]=""
+
+    # 若未配置，回退到单实例默认
+    if [ ${#SERVER_KEYS[@]} -eq 0 ]; then
+        SERVER_KEYS=("server")
+        SERVER_DIRS=("")
     fi
-    
-    # 输出服务器配置（用于调试）
-    for key in "${!servers[@]}"; do
-        echo "$key=${servers[$key]}"
-    done
 }
 
-# 获取实例配置
+# 获取实例配置（通过有序解析，避免重复读取配置）
 get_instance_config() {
     local instance_name="$1"
-    declare -A servers
-    
-    if [ -f "$SERVERS_CONFIG" ]; then
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            servers["$key"]="$value"
-        done < "$SERVERS_CONFIG"
-    fi
-    
-    # 如果没有配置文件，使用默认配置
-    if [ ${#servers[@]} -eq 0 ]; then
-        servers["server"]=""
-    fi
-    
-    # 检查实例是否存在
-    if [[ -n "${servers[$instance_name]}" ]] || [[ "$instance_name" == "server" && -z "${servers[$instance_name]}" ]]; then
-        local instance_dir="${servers[$instance_name]}"
-        if [ -z "$instance_dir" ]; then
-            APP_RUNTIME_HOME="$APP_HOME"
-        else
-            APP_RUNTIME_HOME="$APP_HOME/$instance_dir"
+
+    # 读取有序服务器列表
+    read_servers_ordered
+
+    # 定位实例索引
+    local idx=-1
+    local i
+    for i in "${!SERVER_KEYS[@]}"; do
+        if [ "$instance_name" = "${SERVER_KEYS[$i]}" ]; then
+            idx=$i
+            break
         fi
-        
-        # 设置实例相关变量
-        PID_FILE="${APP_RUNTIME_HOME}/.app.pid"
-        LOG_DIR="${APP_RUNTIME_HOME}/logs"
-        LOG_FILE="${ALL_LOG_DIR}/${APP_NAME}.out"
-        
-        # 创建实例日志目录
-        mkdir -p "$LOG_DIR"
-        
-        # 设置配置选项
-        setup_config_opts
-        setup_loader_opts
-        setup_java_opts
-        
-        return 0
-    else
+    done
+
+    # 不存在则返回失败
+    if [ $idx -lt 0 ]; then
         return 1
     fi
+
+    # 解析实例目录
+    local instance_dir="${SERVER_DIRS[$idx]}"
+    if [ -z "$instance_dir" ]; then
+        APP_RUNTIME_HOME="$APP_HOME"
+    else
+        APP_RUNTIME_HOME="$APP_HOME/$instance_dir"
+    fi
+
+    # 设置实例相关变量
+    PID_FILE="${APP_RUNTIME_HOME}/.app.pid"
+    LOG_DIR="${APP_RUNTIME_HOME}/logs"
+    LOG_FILE="${LOG_DIR}/${APP_NAME}.out"
+
+    # 创建实例日志目录
+    mkdir -p "$LOG_DIR"
+
+    # 设置配置及JVM选项
+    setup_config_opts
+    setup_loader_opts
+    setup_java_opts
+
+    return 0
 }
 
 # 设置配置选项
@@ -118,23 +113,121 @@ setup_loader_opts() {
     LOADER_OPTS="-Dloader.path=${PATCH_CLASSPATH},${APP_RUNTIME_HOME}/config/,${APP_HOME}/config/,${APP_HOME}/lib/"
 }
 
+# JVM 版本检测（设置 JAVA_MAJOR_VERSION）
+detect_java_major_version() {
+    local java_bin
+    if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+        java_bin="$JAVA_HOME/bin/java"
+    else
+        java_bin="java"
+    fi
+    local ver_str
+    ver_str=$("$java_bin" -version 2>&1 | awk -F '"' '/version/ {print $2}')
+    if [[ "$ver_str" =~ ^1\.([0-9]+)\. ]]; then
+        JAVA_MAJOR_VERSION="${BASH_REMATCH[1]}"
+    else
+        JAVA_MAJOR_VERSION="${ver_str%%.*}"
+    fi
+}
+
+# 加载/覆盖 JVM 可调参数（支持外置配置）
+load_jvm_tunables() {
+    # 默认值（可被外部文件覆盖）
+    JVM_XMS=${JVM_XMS:-2g}
+    JVM_XMX=${JVM_XMX:-4g}
+    JVM_METASPACE_SIZE=${JVM_METASPACE_SIZE:-128m}
+    JVM_MAX_METASPACE_SIZE=${JVM_MAX_METASPACE_SIZE:-512m}
+    # JDK 8 PermGen 参数（仅 JDK 8 使用）
+    JVM_PERM_SIZE=${JVM_PERM_SIZE:-256m}
+    JVM_MAX_PERM_SIZE=${JVM_MAX_PERM_SIZE:-512m}
+    JVM_MAX_GC_PAUSE_MS=${JVM_MAX_GC_PAUSE_MS:-200}
+    JVM_IHOP=${JVM_IHOP:-45}
+    JVM_GC_LOG_FILESIZE=${JVM_GC_LOG_FILESIZE:-20M}
+    JVM_GC_LOG_FILECOUNT=${JVM_GC_LOG_FILECOUNT:-5}
+    JVM_THREAD_STACK_SIZE=${JVM_THREAD_STACK_SIZE:-}
+    JVM_HEAP_DUMP_PATH=${JVM_HEAP_DUMP_PATH:-${LOG_DIR}/heapdump.hprof}
+    JVM_ERROR_FILE=${JVM_ERROR_FILE:-${LOG_DIR}/hs_err_pid%p.log}
+    EXTRA_JAVA_OPTS=${EXTRA_JAVA_OPTS:-}
+
+    # 外置配置位置：与 startup.sh 位于相同目录
+    local start_cfg="${APP_HOME}/start/jvm-env.sh"
+    if [ -f "$start_cfg" ]; then
+        # shellcheck disable=SC1090
+        . "$start_cfg"
+    fi
+}
+
+# 构建不同 JDK 版本的推荐 JVM 参数
+build_java_opts_for_version() {
+    detect_java_major_version
+    load_jvm_tunables
+
+    # 各版本按需构建参数
+    case "$JAVA_MAJOR_VERSION" in
+        8)
+            # JDK 8: 使用 PermGen + 旧式 GC 日志
+            local JDK8_OPTS=""
+            JDK8_OPTS="$JDK8_OPTS -server"
+            JDK8_OPTS="$JDK8_OPTS -Xms${JVM_XMS} -Xmx${JVM_XMX}"
+            JDK8_OPTS="$JDK8_OPTS -XX:PermSize=${JVM_PERM_SIZE} -XX:MaxPermSize=${JVM_MAX_PERM_SIZE}"
+            JDK8_OPTS="$JDK8_OPTS -XX:+UseG1GC -XX:MaxGCPauseMillis=${JVM_MAX_GC_PAUSE_MS} -XX:InitiatingHeapOccupancyPercent=${JVM_IHOP}"
+            JDK8_OPTS="$JDK8_OPTS -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication"
+            JDK8_OPTS="$JDK8_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${JVM_HEAP_DUMP_PATH} -XX:ErrorFile=${JVM_ERROR_FILE}"
+            if [ -n "$JVM_THREAD_STACK_SIZE" ]; then
+                JDK8_OPTS="$JDK8_OPTS -Xss${JVM_THREAD_STACK_SIZE}"
+            fi
+            # JDK 8 GC 日志（旧式）
+            JDK8_OPTS="$JDK8_OPTS -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:${LOG_DIR}/gc.log"
+            JDK8_OPTS="$JDK8_OPTS -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=${JVM_GC_LOG_FILECOUNT} -XX:GCLogFileSize=${JVM_GC_LOG_FILESIZE}"
+            JAVA_VERSION_OPTS="$JDK8_OPTS"
+            ;;
+        11|17|21|25)
+            # JDK 11/17/21/25: 使用 Metaspace + 新式 -Xlog GC 日志
+            local MODERN_OPTS=""
+            MODERN_OPTS="$MODERN_OPTS -server"
+            MODERN_OPTS="$MODERN_OPTS -Xms${JVM_XMS} -Xmx${JVM_XMX}"
+            MODERN_OPTS="$MODERN_OPTS -XX:MetaspaceSize=${JVM_METASPACE_SIZE} -XX:MaxMetaspaceSize=${JVM_MAX_METASPACE_SIZE}"
+            MODERN_OPTS="$MODERN_OPTS -XX:+UseG1GC -XX:MaxGCPauseMillis=${JVM_MAX_GC_PAUSE_MS} -XX:InitiatingHeapOccupancyPercent=${JVM_IHOP}"
+            MODERN_OPTS="$MODERN_OPTS -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication"
+            MODERN_OPTS="$MODERN_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${JVM_HEAP_DUMP_PATH} -XX:ErrorFile=${JVM_ERROR_FILE}"
+            if [ -n "$JVM_THREAD_STACK_SIZE" ]; then
+                MODERN_OPTS="$MODERN_OPTS -Xss${JVM_THREAD_STACK_SIZE}"
+            fi
+            # JDK 11+ GC 日志（新式 -Xlog）
+            MODERN_OPTS="$MODERN_OPTS -Xlog:gc*,safepoint:file=${LOG_DIR}/gc.log:time,level,tags:filecount=${JVM_GC_LOG_FILECOUNT},filesize=${JVM_GC_LOG_FILESIZE}"
+            JAVA_VERSION_OPTS="$MODERN_OPTS"
+            ;;
+        *)
+            # 兜底：JDK 9/10 或未识别版本，使用现代参数集
+            local FALLBACK_OPTS=""
+            FALLBACK_OPTS="$FALLBACK_OPTS -server"
+            FALLBACK_OPTS="$FALLBACK_OPTS -Xms${JVM_XMS} -Xmx${JVM_XMX}"
+            FALLBACK_OPTS="$FALLBACK_OPTS -XX:MetaspaceSize=${JVM_METASPACE_SIZE} -XX:MaxMetaspaceSize=${JVM_MAX_METASPACE_SIZE}"
+            FALLBACK_OPTS="$FALLBACK_OPTS -XX:+UseG1GC -XX:MaxGCPauseMillis=${JVM_MAX_GC_PAUSE_MS} -XX:InitiatingHeapOccupancyPercent=${JVM_IHOP}"
+            FALLBACK_OPTS="$FALLBACK_OPTS -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication"
+            FALLBACK_OPTS="$FALLBACK_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${JVM_HEAP_DUMP_PATH} -XX:ErrorFile=${JVM_ERROR_FILE}"
+            if [ -n "$JVM_THREAD_STACK_SIZE" ]; then
+                FALLBACK_OPTS="$FALLBACK_OPTS -Xss${JVM_THREAD_STACK_SIZE}"
+            fi
+            FALLBACK_OPTS="$FALLBACK_OPTS -Xlog:gc*,safepoint:file=${LOG_DIR}/gc.log:time,level,tags:filecount=${JVM_GC_LOG_FILECOUNT},filesize=${JVM_GC_LOG_FILESIZE}"
+            JAVA_VERSION_OPTS="$FALLBACK_OPTS"
+            ;;
+    esac
+
+    # 系统/应用级通用 -D
+    local SYS_PROPS="-Djson.defaultWriterFeatures=LargeObject -DLOG_HOME=${LOG_DIR} -Dlogging.file.path=${LOG_DIR} -Duser.dir=${APP_RUNTIME_HOME}"
+
+    # 允许追加自定义参数
+    if [ -n "$EXTRA_JAVA_OPTS" ]; then
+        JAVA_OPTS="$JAVA_VERSION_OPTS $SYS_PROPS $EXTRA_JAVA_OPTS"
+    else
+        JAVA_OPTS="$JAVA_VERSION_OPTS $SYS_PROPS"
+    fi
+}
+
 # 设置JVM参数（在获取实例配置后调用）
 setup_java_opts() {
-    JAVA_OPTS="-server \
-        -Xms2g -Xmx4g \
-        -XX:PermSize=256m -XX:MaxPermSize=512m \
-        -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:InitiatingHeapOccupancyPercent=45 \
-        -XX:G1HeapRegionSize=16m -XX:+ParallelRefProcEnabled \
-        -XX:+UseStringDeduplication \
-        -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${LOG_DIR}/heapdump.hprof \
-        -XX:ErrorFile=${LOG_DIR}/hs_err_pid%p.log \
-        -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:${LOG_DIR}/gc.log \
-        -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=5 -XX:GCLogFileSize=20m \
-        -XX:+DisableExplicitGC \
-        -Djson.defaultWriterFeatures=LargeObject \
-        -DLOG_HOME=${LOG_DIR} \
-        -Dlogging.file.path=${LOG_DIR} \
-        -Duser.dir=${APP_RUNTIME_HOME}"
+    build_java_opts_for_version
 }
 
 # 检查应用是否运行
@@ -262,39 +355,21 @@ start() {
     fi
 }
 
-# 启动所有实例
+# 启动所有实例（按配置文件顺序）
 start_all() {
-    declare -A servers
-    declare -a server_keys
+    read_servers_ordered
     local success_count=0
-    local total_count=0
-    
-    # 加载服务器配置
-    if [ -f "$SERVERS_CONFIG" ]; then
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            servers["$key"]="$value"
-            server_keys+=("$key")
-        done < "$SERVERS_CONFIG"
-    fi
-    
-    # 如果没有配置文件，使用默认配置
-    if [ ${#servers[@]} -eq 0 ]; then
-        servers["server"]=""
-        server_keys=("server")
-    fi
-    
+    local total_count=${#SERVER_KEYS[@]}
+
     echo "=> 开始启动所有实例..."
-    echo "=> 发现 ${#server_keys[@]} 个实例"
+    echo "=> 发现 ${#SERVER_KEYS[@]} 个实例"
     echo ""
-    
-    # 逐个启动实例
-    for instance_name in "${server_keys[@]}"; do
-        total_count=$((total_count + 1))
-        echo "[$total_count/${#server_keys[@]}] 启动实例: $instance_name"
-        
+
+    local idx=0
+    for instance_name in "${SERVER_KEYS[@]}"; do
+        idx=$((idx + 1))
+        echo "[$idx/${#SERVER_KEYS[@]}] 启动实例: $instance_name"
+
         # 在子shell中启动实例，避免变量污染和PID混乱
         (
             if start "$instance_name"; then
@@ -303,7 +378,7 @@ start_all() {
                 exit 1
             fi
         )
-        
+
         if [ $? -eq 0 ]; then
             success_count=$((success_count + 1))
             echo "✓ 实例 '$instance_name' 启动成功"
@@ -311,15 +386,15 @@ start_all() {
             echo "✗ 实例 '$instance_name' 启动失败"
         fi
         echo ""
-        
+
         # 实例间启动间隔，避免资源竞争
-        if [ $total_count -lt ${#server_keys[@]} ]; then
+        if [ $idx -lt ${#SERVER_KEYS[@]} ]; then
             sleep 3
         fi
     done
-    
+
     echo "=> 启动完成: $success_count/$total_count 个实例启动成功"
-    
+
     if [ $success_count -eq $total_count ]; then
         echo "=> 所有实例启动成功!"
         return 0
@@ -365,39 +440,21 @@ stop() {
     return 0
 }
 
-# 停止所有实例
+# 停止所有实例（按配置文件顺序）
 stop_all() {
-    declare -A servers
-    declare -a server_keys
+    read_servers_ordered
     local success_count=0
-    local total_count=0
-    
-    # 加载服务器配置
-    if [ -f "$SERVERS_CONFIG" ]; then
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            servers["$key"]="$value"
-            server_keys+=("$key")
-        done < "$SERVERS_CONFIG"
-    fi
-    
-    # 如果没有配置文件，使用默认配置
-    if [ ${#servers[@]} -eq 0 ]; then
-        servers["server"]=""
-        server_keys=("server")
-    fi
-    
+    local total_count=${#SERVER_KEYS[@]}
+
     echo "=> 开始停止所有实例..."
-    echo "=> 发现 ${#server_keys[@]} 个实例"
+    echo "=> 发现 ${#SERVER_KEYS[@]} 个实例"
     echo ""
-    
-    # 逐个停止实例
-    for instance_name in "${server_keys[@]}"; do
-        total_count=$((total_count + 1))
-        echo "[$total_count/${#server_keys[@]}] 停止实例: $instance_name"
-        
+
+    local idx=0
+    for instance_name in "${SERVER_KEYS[@]}"; do
+        idx=$((idx + 1))
+        echo "[$idx/${#SERVER_KEYS[@]}] 停止实例: $instance_name"
+
         # 在子shell中停止实例，避免变量污染
         (
             if stop "$instance_name"; then
@@ -406,7 +463,7 @@ stop_all() {
                 exit 1
             fi
         )
-        
+
         if [ $? -eq 0 ]; then
             success_count=$((success_count + 1))
             echo "✓ 实例 '$instance_name' 停止成功"
@@ -415,9 +472,9 @@ stop_all() {
         fi
         echo ""
     done
-    
+
     echo "=> 停止完成: $success_count/$total_count 个实例停止成功"
-    
+
     if [ $success_count -eq $total_count ]; then
         echo "=> 所有实例停止成功!"
         return 0
@@ -435,41 +492,23 @@ restart() {
     start "$instance_name"
 }
 
-# 滚动重启所有实例（保障业务连续性）
+# 滚动重启所有实例（保障业务连续性，按配置文件顺序）
 restart_all() {
-    declare -A servers
-    declare -a server_keys
+    read_servers_ordered
     local success_count=0
-    local total_count=0
-    
-    # 加载服务器配置
-    if [ -f "$SERVERS_CONFIG" ]; then
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            servers["$key"]="$value"
-            server_keys+=("$key")
-        done < "$SERVERS_CONFIG"
-    fi
-    
-    # 如果没有配置文件，使用默认配置
-    if [ ${#servers[@]} -eq 0 ]; then
-        servers["server"]=""
-        server_keys=("server")
-    fi
-    
+    local total_count=${#SERVER_KEYS[@]}
+
     echo "=> 开始滚动重启所有实例（保障业务连续性）..."
-    echo "=> 发现 ${#server_keys[@]} 个实例"
+    echo "=> 发现 ${#SERVER_KEYS[@]} 个实例"
     echo "=> 策略：逐个重启，如有失败则停止后续重启"
     echo ""
-    
-    # 逐个滚动重启实例
-    for instance_name in "${server_keys[@]}"; do
-        total_count=$((total_count + 1))
-        echo "[$total_count/${#server_keys[@]}] 滚动重启实例: $instance_name"
+
+    local idx=0
+    for instance_name in "${SERVER_KEYS[@]}"; do
+        idx=$((idx + 1))
+        echo "[$idx/${#SERVER_KEYS[@]}] 滚动重启实例: $instance_name"
         echo ""
-        
+
         # 在子shell中重启实例，避免变量污染
         (
             echo "  => 步骤1: 停止实例 $instance_name"
@@ -488,13 +527,13 @@ restart_all() {
                 exit 1
             fi
         )
-        
+
         if [ $? -eq 0 ]; then
             success_count=$((success_count + 1))
             echo "✓ 实例 '$instance_name' 滚动重启成功"
-            
+
             # 重启成功后等待一段时间，确保服务稳定后再重启下一个
-            if [ $total_count -lt ${#server_keys[@]} ]; then
+            if [ $idx -lt ${#SERVER_KEYS[@]} ]; then
                 echo "  => 等待 10 秒确保服务稳定，然后重启下一个实例..."
                 sleep 10
             fi
@@ -503,8 +542,8 @@ restart_all() {
             echo ""
             echo "⚠️  警告: 检测到重启失败，为保障业务连续性，立即终止滚动重启过程"
             echo "=> 已成功重启: $success_count 个实例"
-            echo "=> 失败位置: 第 $total_count 个实例 ($instance_name)"
-            echo "=> 剩余未重启: $((${#server_keys[@]} - total_count)) 个实例"
+            echo "=> 失败位置: 第 $idx 个实例 ($instance_name)"
+            echo "=> 剩余未重启: $((${#SERVER_KEYS[@]} - idx)) 个实例"
             echo ""
             echo "🛡️  保护措施: 保持其他正在运行的实例不受影响"
             echo "📋 建议操作:"
@@ -522,9 +561,9 @@ restart_all() {
         fi
         echo ""
     done
-    
+
     echo "=> 滚动重启完成: $success_count/$total_count 个实例重启成功"
-    
+
     if [ $success_count -eq $total_count ]; then
         echo "=> 所有实例滚动重启成功! 业务连续性得到保障"
         return 0
@@ -556,35 +595,20 @@ status() {
     fi
 }
 
-# 显示可用实例列表
+# 显示可用实例列表（与配置文件顺序一致）
 show_instances() {
     echo "可用的实例:"
-    declare -A servers
-    
-    if [ -f "$SERVERS_CONFIG" ]; then
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            servers["$key"]="$value"
-        done < "$SERVERS_CONFIG"
-    fi
-    
-    # 如果没有配置文件，使用默认配置
-    if [ ${#servers[@]} -eq 0 ]; then
-        servers["server"]=""
-    fi
-    
-    local count=1
-    for key in "${!servers[@]}"; do
-        local dir="${servers[$key]}"
+    read_servers_ordered
+    for i in "${!SERVER_KEYS[@]}"; do
+        local key="${SERVER_KEYS[$i]}"
+        local dir="${SERVER_DIRS[$i]}"
+        local display_dir
         if [ -z "$dir" ]; then
-            dir="$APP_HOME (默认)"
+            display_dir="$APP_HOME (默认)"
         else
-            dir="$APP_HOME/$dir"
+            display_dir="$APP_HOME/$dir"
         fi
-        echo "$count. $key -> $dir"
-        ((count++))
+        echo "$((i+1)). $key -> $display_dir"
     done
 }
 
@@ -625,103 +649,70 @@ validate_command() {
     esac
 }
 
-# 获取实例选择
+# 获取实例选择（保持与配置文件顺序一致）
 get_instance_choice() {
-    declare -A servers
-    declare -a server_keys
-    
-    if [ -f "$SERVERS_CONFIG" ]; then
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            servers["$key"]="$value"
-            server_keys+=("$key")
-        done < "$SERVERS_CONFIG"
-    fi
-    
-    # 如果没有配置文件，使用默认配置
-    if [ ${#servers[@]} -eq 0 ]; then
-        servers["server"]=""
-        server_keys=("server")
-    fi
-    
+    read_servers_ordered
+
     # 如果只有一个实例，直接返回
-    if [ ${#server_keys[@]} -eq 1 ]; then
-        echo "${server_keys[0]}"
+    if [ ${#SERVER_KEYS[@]} -eq 1 ]; then
+        echo "${SERVER_KEYS[0]}"
         return 0
     fi
-    
+
     # 显示实例选择菜单
     echo ""
     echo "请选择要操作的实例:"
     show_instances
     echo ""
     echo "请输入实例名称或对应数字:"
-    
+
     while true; do
         read -r user_input
-        
+
         if [ -z "$user_input" ]; then
             echo "输入不能为空，请重新选择。"
             continue
         fi
-        
-        # 检查是否是数字选择
+
+        # 数字选择
         if [[ "$user_input" =~ ^[0-9]+$ ]]; then
             local index=$((user_input - 1))
-            if [ $index -ge 0 ] && [ $index -lt ${#server_keys[@]} ]; then
-                echo "${server_keys[$index]}"
+            if [ $index -ge 0 ] && [ $index -lt ${#SERVER_KEYS[@]} ]; then
+                echo "${SERVER_KEYS[$index]}"
                 return 0
             else
                 echo "数字选择超出范围，请重新选择。"
                 continue
             fi
         fi
-        
-        # 检查是否是实例名称
-        if [[ -n "${servers[$user_input]}" ]]; then
-            echo "$user_input"
-            return 0
-        else
-            echo "实例 '$user_input' 不存在，请重新选择。"
-        fi
+
+        # 名称选择
+        for i in "${!SERVER_KEYS[@]}"; do
+            if [ "$user_input" = "${SERVER_KEYS[$i]}" ]; then
+                echo "$user_input"
+                return 0
+            fi
+        done
+
+        echo "实例 '$user_input' 不存在，请重新选择。"
     done
 }
 
-# 检查所有实例状态
+# 检查所有实例状态（按配置文件顺序）
 status_all() {
-    declare -A servers
-    declare -a server_keys
+    read_servers_ordered
     local running_count=0
-    local total_count=0
-    
-    # 加载服务器配置
-    if [ -f "$SERVERS_CONFIG" ]; then
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            servers["$key"]="$value"
-            server_keys+=("$key")
-        done < "$SERVERS_CONFIG"
-    fi
-    
-    # 如果没有配置文件，使用默认配置
-    if [ ${#servers[@]} -eq 0 ]; then
-        servers["server"]=""
-        server_keys=("server")
-    fi
-    
+    local total_count=${#SERVER_KEYS[@]}
+
     echo "=> 检查所有实例状态..."
-    echo "=> 发现 ${#server_keys[@]} 个实例"
+    echo "=> 发现 ${#SERVER_KEYS[@]} 个实例"
     echo ""
-    
-    # 逐个检查实例状态
-    for instance_name in "${server_keys[@]}"; do
-        total_count=$((total_count + 1))
-        echo "[$total_count/${#server_keys[@]}] 实例: $instance_name"
-        
+
+    local idx=0
+    for instance_name in "${SERVER_KEYS[@]}"; do
+        idx=$((idx + 1))
+        echo "[$idx/${#SERVER_KEYS[@]}] 实例: $instance_name"
+
         # 在子shell中检查状态，避免变量污染
         (
             if get_instance_config "$instance_name"; then
@@ -739,7 +730,7 @@ status_all() {
                 exit 1
             fi
         )
-        
+
         if [ $? -eq 0 ]; then
             running_count=$((running_count + 1))
             echo "  ✓ 正常运行"
@@ -748,9 +739,9 @@ status_all() {
         fi
         echo ""
     done
-    
+
     echo "=> 状态汇总: $running_count/$total_count 个实例正在运行"
-    
+
     if [ $running_count -eq $total_count ]; then
         echo "=> 所有实例都在运行!"
         return 0
@@ -857,7 +848,7 @@ main() {
         
         # 检查是否存在servers.properties文件
         if [ -f "$SERVERS_CONFIG" ]; then
-            # 显示实例选择菜单
+            # 显示实例选择菜单（保持与servers.properties的顺序一致）
             show_instances
             echo ""
             echo "输入选项:"
@@ -867,38 +858,38 @@ main() {
             echo "请输入选择:"
             
             read -r user_input
-            
+
+            # 读取配置（保持有序）
+            read_servers_ordered
+
             # 如果用户直接按回车或输入 all，则操作所有实例
             if [ -z "$user_input" ] || [ "$user_input" = "all" ]; then
                 instance="all"
             else
-                # 处理用户输入
-                declare -A servers
-                declare -a server_keys
-                
-                while IFS='=' read -r key value; do
-                    [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-                    key=$(echo "$key" | xargs)
-                    value=$(echo "$value" | xargs)
-                    servers["$key"]="$value"
-                    server_keys+=("$key")
-                done < "$SERVERS_CONFIG"
-                
-                # 检查是否是数字选择
+                # 数字选择
                 if [[ "$user_input" =~ ^[0-9]+$ ]]; then
-                    local index=$((user_input - 1))
-                    if [ $index -ge 0 ] && [ $index -lt ${#server_keys[@]} ]; then
-                        instance="${server_keys[$index]}"
+                    index=$((user_input - 1))
+                    if [ $index -ge 0 ] && [ $index -lt ${#SERVER_KEYS[@]} ]; then
+                        instance="${SERVER_KEYS[$index]}"
                     else
                         echo "数字选择超出范围，默认操作所有实例。"
                         instance="all"
                     fi
-                elif [[ -n "${servers[$user_input]}" ]]; then
-                    # 是有效的实例名称
-                    instance="$user_input"
                 else
-                    echo "实例 '$user_input' 不存在，默认操作所有实例。"
-                    instance="all"
+                    # 名称选择
+                    chosen=""
+                    for i in "${!SERVER_KEYS[@]}"; do
+                        if [ "$user_input" = "${SERVER_KEYS[$i]}" ]; then
+                            chosen="${SERVER_KEYS[$i]}"
+                            break
+                        fi
+                    done
+                    if [ -n "$chosen" ]; then
+                        instance="$chosen"
+                    else
+                        echo "实例 '$user_input' 不存在，默认操作所有实例。"
+                        instance="all"
+                    fi
                 fi
             fi
         else
