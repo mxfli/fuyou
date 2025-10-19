@@ -13,6 +13,10 @@ APP_NAME="nipis-gj-transfer-0.2.0-SNAPSHOT"
 APP_JAR="${APP_HOME}/${APP_NAME}.jar"
 SERVERS_CONFIG="${APP_HOME}/servers.properties"
 
+# 脚本的参数
+MAX_WAIT_TIME=60  # 最大等待时间60秒
+CHECK_INTERVAL=2  # 每2秒检查一次
+
 # 读取多实例配置（无副作用，保持文件顺序）
 read_servers_ordered() {
     # 有序数组（与 servers.properties 行顺序一致）
@@ -79,7 +83,11 @@ get_instance_config() {
     # 设置配置及JVM选项
     setup_config_opts
     setup_loader_opts
-    setup_java_opts
+    
+    if ! setup_java_opts; then
+        echo "=> 错误: Java 环境配置失败，无法继续"
+        return 1
+    fi
 
     return 0
 }
@@ -110,24 +118,72 @@ setup_config_opts() {
 
 # 设置Loader选项
 setup_loader_opts() {
-    LOADER_OPTS="-Dloader.path=${PATCH_CLASSPATH},${APP_RUNTIME_HOME}/config/,${APP_HOME}/config/,${APP_HOME}/lib/"
+    LOADER_OPTS="-Dloader.path=${PATCH_CLASSPATH},${APP_RUNTIME_HOME}/appconfig/,${APP_HOME}/appconfig/,${APP_HOME}/lib/"
 }
 
 # JVM 版本检测（设置 JAVA_MAJOR_VERSION）
 detect_java_major_version() {
     local java_bin
-    if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
-        java_bin="$JAVA_HOME/bin/java"
+    local java_source
+    
+    # 优先使用 JAVA_HOME，并提供诊断信息
+    if [ -n "$JAVA_HOME" ]; then
+        if [ -x "$JAVA_HOME/bin/java" ]; then
+            java_bin="$JAVA_HOME/bin/java"
+            java_source="JAVA_HOME ($JAVA_HOME)"
+            echo "=> 使用 JAVA_HOME 中的 Java: $JAVA_HOME"
+        else
+            echo "=> 警告: JAVA_HOME 已设置但 $JAVA_HOME/bin/java 不可执行"
+            echo "=> 回退使用系统 PATH 中的 java"
+            java_bin="java"
+            java_source="系统 PATH"
+        fi
     else
+        echo "=> 提示: JAVA_HOME 未设置，使用系统 PATH 中的 java"
         java_bin="java"
+        java_source="系统 PATH"
     fi
+    
+    # 检查 java 命令是否可用
+    if ! command -v "$java_bin" >/dev/null 2>&1; then
+        echo "=> 错误: 找不到 Java 可执行文件"
+        echo "=> 建议: 设置 JAVA_HOME 环境变量或确保 java 在 PATH 中"
+        return 1
+    fi
+    
+    # 获取并显示 Java 版本信息
+    local version_output
+    version_output=$("$java_bin" -version 2>&1)
     local ver_str
-    ver_str=$("$java_bin" -version 2>&1 | awk -F '"' '/version/ {print $2}')
+    ver_str=$(echo "$version_output" | awk -F '"' '/version/ {print $2}')
+    
+    if [ -z "$ver_str" ]; then
+        echo "=> 错误: 无法获取 Java 版本信息"
+        echo "=> Java 输出: $version_output"
+        return 1
+    fi
+    
+    # 解析主版本号
     if [[ "$ver_str" =~ ^1\.([0-9]+)\. ]]; then
         JAVA_MAJOR_VERSION="${BASH_REMATCH[1]}"
     else
         JAVA_MAJOR_VERSION="${ver_str%%.*}"
     fi
+    
+    # 显示诊断信息
+    echo "=> Java 版本检测结果:"
+    echo "   - Java 路径: $java_bin"
+    echo "   - Java 来源: $java_source"
+    echo "   - 版本字符串: $ver_str"
+    echo "   - 主版本号: $JAVA_MAJOR_VERSION"
+    
+    # 验证版本号是否为数字
+    if ! [[ "$JAVA_MAJOR_VERSION" =~ ^[0-9]+$ ]]; then
+        echo "=> 警告: 解析的主版本号不是数字: $JAVA_MAJOR_VERSION"
+        return 1
+    fi
+    
+    return 0
 }
 
 # 加载/覆盖 JVM 可调参数（支持外置配置）
@@ -159,7 +215,13 @@ load_jvm_tunables() {
 
 # 构建不同 JDK 版本的推荐 JVM 参数
 build_java_opts_for_version() {
-    detect_java_major_version
+    echo "=> 开始 Java 环境检测..."
+    
+    if ! detect_java_major_version; then
+        echo "=> 错误: Java 版本检测失败，无法继续启动"
+        return 1
+    fi
+    
     load_jvm_tunables
 
     # 各版本按需构建参数
@@ -227,7 +289,10 @@ build_java_opts_for_version() {
 
 # 设置JVM参数（在获取实例配置后调用）
 setup_java_opts() {
-    build_java_opts_for_version
+    if ! build_java_opts_for_version; then
+        echo "=> 错误: JVM 参数构建失败"
+        return 1
+    fi
 }
 
 # 检查应用是否运行
@@ -247,8 +312,8 @@ check_pid() {
 check_spring_boot_startup() {
     local instance_name="$1"
     local java_pid="$2"
-    local max_wait_time=60  # 最大等待时间60秒
-    local check_interval=2  # 每2秒检查一次
+    local max_wait_time=$MAX_WAIT_TIME  # 最大等待时间60秒
+    local check_interval=$CHECK_INTERVAL  # 每2秒检查一次
     local waited_time=0
     
     echo "=> 等待Spring Boot应用启动完成..."
