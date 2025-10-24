@@ -6,16 +6,116 @@
 
 # 获取应用根目录（脚本所在目录的上一级）
 APP_HOME=$(cd "$(dirname "$0")"/.. && pwd)
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+# 加载环境配置
+SET_ENV_FILE="$SCRIPT_DIR/set-env.sh"
+if [ -f "$SET_ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$SET_ENV_FILE"
+fi
 
 # 补丁类路径，用于存放覆盖jar文件中需要打补丁的class
 PATCH_CLASSPATH="$APP_HOME/patch_classpath"
-APP_NAME="nipis-gj-transfer-0.2.0-SNAPSHOT"
-APP_JAR="${APP_HOME}/${APP_NAME}.jar"
+# 应用名称和版本（可通过set-env.sh覆盖）
+APP_NAME="${APP_NAME:-springboot-http-app}"
+APP_VERSION="${APP_VERSION:-}"
 SERVERS_CONFIG="${APP_HOME}/servers.properties"
+
+# 应用JAR和主类将通过智能检测确定
+APP_JAR=""
+JAR_TYPE=""
+MAIN_CLASS=""
 
 # 脚本的参数
 MAX_WAIT_TIME=60  # 最大等待时间60秒
 CHECK_INTERVAL=2  # 每2秒检查一次
+
+# 检测JAR文件和类型
+detect_jar_file_and_type() {
+    echo "=> 检测应用JAR文件..."
+    
+    # 如果APP_VERSION有值，则用减号拼接在APP_NAME之后
+    local jar_name="$APP_NAME"
+    if [ -n "$APP_VERSION" ]; then
+        jar_name="${APP_NAME}-${APP_VERSION}"
+    fi
+    
+    # 设置JAR文件路径
+    APP_JAR="${APP_HOME}/${jar_name}.jar"
+    
+    # 检查JAR文件是否存在
+    if [ ! -f "$APP_JAR" ]; then
+        echo "=> 错误: 应用JAR文件不存在: $APP_JAR"
+        echo "   期望的文件名: ${jar_name}.jar"
+        return 1
+    fi
+    
+    echo "=> 找到应用JAR: $APP_JAR"
+    
+    # 检测JAR类型
+    detect_jar_type_and_main_class
+    return $?
+}
+
+# 检测JAR类型并设置主类
+detect_jar_type_and_main_class() {
+    if [ ! -f "$APP_JAR" ]; then
+        echo "=> 错误: 应用JAR文件不存在: $APP_JAR"
+        return 1
+    fi
+    
+    # 检查是否为 Fat JAR（包含 BOOT-INF 目录）
+    if jar tf "$APP_JAR" | grep -q "^BOOT-INF/"; then
+        echo "=> 检测到 Fat JAR 模式"
+        MAIN_CLASS="org.springframework.boot.loader.JarLauncher"
+        JAR_TYPE="fat"
+    else
+        echo "=> 检测到 Thin JAR 模式"
+        # Thin JAR 使用 -jar 启动，主类由 MANIFEST.MF 指定
+        MAIN_CLASS="(由MANIFEST.MF指定)"
+        JAR_TYPE="thin"
+    fi
+    
+    echo "=> JAR 类型: $JAR_TYPE, 主类: $MAIN_CLASS"
+    return 0
+}
+
+# 从实例目录名中提取端口号
+extract_port_from_instance_dir() {
+    local instance_dir="$1"
+    
+    # 匹配格式: instance-端口号 或 任意名称-端口号
+    if [[ "$instance_dir" =~ -([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    
+    # 如果没有匹配到端口号，返回空
+    echo ""
+    return 1
+}
+
+# 统一的PID文件清理函数
+cleanup_pid_file() {
+    local instance_name="$1"
+    local pid_file="$2"
+    
+    if [ -f "$pid_file" ]; then
+        if rm -f "$pid_file"; then
+            echo "=> 已清理PID文件: $pid_file"
+        else
+            echo "=> 警告: 无法删除PID文件: $pid_file"
+        fi
+    fi
+}
+
+# 优雅停止相关参数
+GRACEFUL_SHUTDOWN_TIMEOUT=${GRACEFUL_SHUTDOWN_TIMEOUT:-30}  # 优雅停止等待时间（秒）
+FORCE_KILL_TIMEOUT=${FORCE_KILL_TIMEOUT:-10}               # 强制终止等待时间（秒）
+ENABLE_ACTUATOR_SHUTDOWN=${ENABLE_ACTUATOR_SHUTDOWN:-false} # 是否启用Actuator shutdown
+ACTUATOR_SHUTDOWN_PORT=${ACTUATOR_SHUTDOWN_PORT:-8080}      # Actuator端口
+ACTUATOR_SHUTDOWN_TIMEOUT=${ACTUATOR_SHUTDOWN_TIMEOUT:-5}   # Actuator shutdown超时时间（秒）
 
 # 读取多实例配置（无副作用，保持文件顺序）
 read_servers_ordered() {
@@ -27,11 +127,20 @@ read_servers_ordered() {
         while IFS='=' read -r key value; do
             # 跳过空行和注释
             [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            # 去除前后空格
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            SERVER_KEYS+=("$key")
-            SERVER_DIRS+=("$value")
+            
+            # 安全的去除前后空格，避免命令注入
+            key="${key#"${key%%[![:space:]]*}"}"    # 去除前导空格
+            key="${key%"${key##*[![:space:]]}"}"    # 去除尾随空格
+            value="${value#"${value%%[![:space:]]*}"}"  # 去除前导空格
+            value="${value%"${value##*[![:space:]]}"}"  # 去除尾随空格
+            
+            # 验证key的合法性（只允许字母数字和下划线）
+            if [[ "$key" =~ ^[a-zA-Z0-9_]+$ ]]; then
+                SERVER_KEYS+=("$key")
+                SERVER_DIRS+=("$value")
+            else
+                echo "=> 警告: 跳过无效的实例名称: $key"
+            fi
         done < "$SERVERS_CONFIG"
     fi
 
@@ -68,21 +177,43 @@ get_instance_config() {
     local instance_dir="${SERVER_DIRS[$idx]}"
     if [ -z "$instance_dir" ]; then
         APP_RUNTIME_HOME="$APP_HOME"
+        INSTANCE_PORT=""
     else
         APP_RUNTIME_HOME="$APP_HOME/$instance_dir"
+        # 从实例目录名中提取端口号
+        INSTANCE_PORT=$(extract_port_from_instance_dir "$instance_dir")
+        if [ -n "$INSTANCE_PORT" ]; then
+            echo "=> 检测到实例端口: $INSTANCE_PORT"
+        fi
     fi
 
     # 设置实例相关变量
     PID_FILE="${APP_RUNTIME_HOME}/.app.pid"
     LOG_DIR="${APP_RUNTIME_HOME}/logs"
-    LOG_FILE="${LOG_DIR}/${APP_NAME}.out"
+    LOG_FILE="${LOG_DIR}/${APP_NAME}${APP_VERSION:+-${APP_VERSION}}.out"
 
     # 创建实例日志目录
-    mkdir -p "$LOG_DIR"
+    if ! mkdir -p "$LOG_DIR"; then
+        echo "=> 错误: 无法创建日志目录: $LOG_DIR"
+        return 1
+    fi
 
-    # 设置配置及JVM选项
-    setup_config_opts
-    setup_loader_opts
+    # 智能检测JAR文件和类型
+    if ! detect_jar_file_and_type; then
+        echo "=> 错误: JAR文件检测失败"
+        return 1
+    fi
+    
+    # 设置配置及JVM选项 - 增加错误检查
+    if ! setup_config_opts; then
+        echo "=> 错误: 配置选项设置失败"
+        return 1
+    fi
+    
+    if ! setup_loader_opts; then
+        echo "=> 错误: Loader选项设置失败"
+        return 1
+    fi
     
     if ! setup_java_opts; then
         echo "=> 错误: Java 环境配置失败，无法继续"
@@ -97,9 +228,23 @@ setup_config_opts() {
     local runtime_config="${APP_RUNTIME_HOME}/appconfig/"
     local app_config="${APP_HOME}/appconfig/"
     
+    # 验证必要的变量是否已设置
+    if [ -z "$APP_RUNTIME_HOME" ] || [ -z "$APP_HOME" ]; then
+        echo "=> 错误: 应用路径变量未正确设置"
+        return 1
+    fi
+    
     # 设置活动配置文件
-    ACTIVE_PROFILE="prod"
+    # 优先使用配置文件中的SPRING_PROFILES_ACTIVE，如果未设置则使用default
+    ACTIVE_PROFILE="${SPRING_PROFILES_ACTIVE:-default}"
+    echo "=> 使用Spring Profile: $ACTIVE_PROFILE"
     CONFIG_OPTS="-Dspring.profiles.active=${ACTIVE_PROFILE}"
+    
+    # 如果检测到端口号，自动设置服务端口
+    if [ -n "$INSTANCE_PORT" ]; then
+        CONFIG_OPTS="$CONFIG_OPTS -Dserver.port=${INSTANCE_PORT}"
+        echo "=> 自动设置服务端口: $INSTANCE_PORT"
+    fi
     
     if [ -d "$runtime_config" ]; then
         CONFIG_OPTS="$CONFIG_OPTS -Dspring.config.location=file:${runtime_config}"
@@ -114,11 +259,36 @@ setup_config_opts() {
             CONFIG_OPTS="$CONFIG_OPTS -Dlogging.config=${app_config}logback-spring.xml"
         fi
     fi
+    
+    return 0
 }
 
-# 设置Loader选项
+# 设置Loader选项（根据JAR类型）
 setup_loader_opts() {
-    LOADER_OPTS="-Dloader.path=${PATCH_CLASSPATH},${APP_RUNTIME_HOME}/appconfig/,${APP_HOME}/appconfig/,${APP_HOME}/lib/"
+    # 验证必要的变量是否已设置
+    if [ -z "$APP_JAR" ] || [ -z "$APP_HOME" ] || [ -z "$APP_RUNTIME_HOME" ]; then
+        echo "=> 错误: 应用路径变量未正确设置"
+        return 1
+    fi
+    
+    # 确保JAR类型已检测
+    if [ -z "$JAR_TYPE" ]; then
+        echo "=> 错误: JAR类型未检测，请先调用 detect_jar_file_and_type"
+        return 1
+    fi
+    
+    # 根据JAR类型设置不同的选项
+    if [ "$JAR_TYPE" = "fat" ]; then
+        # Fat JAR: 使用 -Dloader.path 加载外部依赖
+        LOADER_OPTS="-Dloader.path=${PATCH_CLASSPATH},${APP_RUNTIME_HOME}/config/,${APP_HOME}/config/,${APP_HOME}/lib/"
+        echo "=> Fat JAR Loader路径: ${PATCH_CLASSPATH},${APP_RUNTIME_HOME}/config/,${APP_HOME}/config/,${APP_HOME}/lib/"
+    else
+        # Thin JAR: 不使用 -Dloader.path，依赖MANIFEST.MF中的Class-Path
+        LOADER_OPTS=""
+        echo "=> Thin JAR: 使用MANIFEST.MF中的Class-Path，无需额外loader.path"
+    fi
+    
+    return 0
 }
 
 # JVM 版本检测（设置 JAVA_MAJOR_VERSION）
@@ -186,6 +356,27 @@ detect_java_major_version() {
     return 0
 }
 
+# 加载优雅停止配置（支持外置配置）
+load_shutdown_config() {
+    # 外置配置位置：与 startup.sh 位于相同目录
+    local shutdown_cfg="$SCRIPT_DIR/shutdown-env.sh"
+    if [ -f "$shutdown_cfg" ]; then
+        echo "=> 加载优雅停止配置: $shutdown_cfg"
+        # shellcheck disable=SC1090
+        . "$shutdown_cfg"
+    fi
+    
+    # 显示当前配置
+    echo "=> 优雅停止配置:"
+    echo "   - SIGTERM 等待时间: ${GRACEFUL_SHUTDOWN_TIMEOUT}秒"
+    echo "   - SIGKILL 等待时间: ${FORCE_KILL_TIMEOUT}秒"
+    echo "   - Actuator shutdown: $([ "$ENABLE_ACTUATOR_SHUTDOWN" = "true" ] && echo "启用" || echo "禁用")"
+    if [ "$ENABLE_ACTUATOR_SHUTDOWN" = "true" ]; then
+        echo "   - Actuator 端口: ${ACTUATOR_SHUTDOWN_PORT}"
+        echo "   - Actuator 超时: ${ACTUATOR_SHUTDOWN_TIMEOUT}秒"
+    fi
+}
+
 # 加载/覆盖 JVM 可调参数（支持外置配置）
 load_jvm_tunables() {
     # 默认值（可被外部文件覆盖）
@@ -204,10 +395,13 @@ load_jvm_tunables() {
     JVM_HEAP_DUMP_PATH=${JVM_HEAP_DUMP_PATH:-${LOG_DIR}/heapdump.hprof}
     JVM_ERROR_FILE=${JVM_ERROR_FILE:-${LOG_DIR}/hs_err_pid%p.log}
     EXTRA_JAVA_OPTS=${EXTRA_JAVA_OPTS:-}
+    
+    # 注意：MAIN_CLASS 已在脚本开头设置，此处不再重复设置
 
     # 外置配置位置：与 startup.sh 位于相同目录
-    local start_cfg="${APP_HOME}/start/jvm-env.sh"
+    local start_cfg="$SCRIPT_DIR/jvm-env.sh"
     if [ -f "$start_cfg" ]; then
+        echo "=> 加载JVM配置: $start_cfg"
         # shellcheck disable=SC1090
         . "$start_cfg"
     fi
@@ -227,11 +421,11 @@ build_java_opts_for_version() {
     # 各版本按需构建参数
     case "$JAVA_MAJOR_VERSION" in
         8)
-            # JDK 8: 使用 PermGen + 旧式 GC 日志
+            # JDK 8: 使用 Metaspace（PermGen 在 JDK 8 中已移除）+ 旧式 GC 日志
             local JDK8_OPTS=""
             JDK8_OPTS="$JDK8_OPTS -server"
             JDK8_OPTS="$JDK8_OPTS -Xms${JVM_XMS} -Xmx${JVM_XMX}"
-            JDK8_OPTS="$JDK8_OPTS -XX:PermSize=${JVM_PERM_SIZE} -XX:MaxPermSize=${JVM_MAX_PERM_SIZE}"
+            JDK8_OPTS="$JDK8_OPTS -XX:MetaspaceSize=${JVM_METASPACE_SIZE} -XX:MaxMetaspaceSize=${JVM_MAX_METASPACE_SIZE}"
             JDK8_OPTS="$JDK8_OPTS -XX:+UseG1GC -XX:MaxGCPauseMillis=${JVM_MAX_GC_PAUSE_MS} -XX:InitiatingHeapOccupancyPercent=${JVM_IHOP}"
             JDK8_OPTS="$JDK8_OPTS -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication"
             JDK8_OPTS="$JDK8_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${JVM_HEAP_DUMP_PATH} -XX:ErrorFile=${JVM_ERROR_FILE}"
@@ -322,7 +516,7 @@ check_spring_boot_startup() {
         # 首先检查进程是否还存在
         if ! kill -0 $java_pid 2>/dev/null; then
             echo "=> 警告: 进程 $java_pid 已停止"
-            rm -f "$PID_FILE"
+            cleanup_pid_file "$instance_name" "$PID_FILE"
             return 1
         fi
         
@@ -337,14 +531,14 @@ check_spring_boot_startup() {
             # 检查是否有应用关闭的标识
             if grep -qE "(Stopping|Shutdown|Application shutdown|Shutting down|stopped in|Closing)" "$LOG_FILE" 2>/dev/null; then
                 echo "=> 警告: 检测到应用关闭信号，启动失败"
-                rm -f "$PID_FILE"
+                cleanup_pid_file "$instance_name" "$PID_FILE"
                 return 1
             fi
             
             # 检查是否有严重错误
             if grep -qE "(Exception|Error.*startup|Failed to start|Unable to start|startup failed)" "$LOG_FILE" 2>/dev/null; then
                 echo "=> 警告: 检测到启动错误"
-                rm -f "$PID_FILE"
+                cleanup_pid_file "$instance_name" "$PID_FILE"
                 return 1
             fi
         fi
@@ -364,7 +558,7 @@ check_spring_boot_startup() {
         return 1
     else
         echo "=> 进程已停止，启动失败"
-        rm -f "$PID_FILE"
+        cleanup_pid_file "$instance_name" "$PID_FILE"
         return 1
     fi
 }
@@ -392,8 +586,17 @@ start() {
     # 清空或创建日志文件，确保检查的是当前启动的日志
     > "$LOG_FILE"
     
-    # 使用 nohup 启动并将日志追加到日志文件，同时在后台运行
-    nohup java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar $APP_JAR >> "$LOG_FILE" 2>&1 &
+    # 根据JAR类型构建启动命令
+    # 统一使用 -jar 启动方式（适用于Fat JAR和Thin JAR）
+    echo "=> 启动方式: JAR 模式 (-jar)"
+    echo "=> JAR文件: $APP_JAR"
+    echo "=> JAR类型: $JAR_TYPE"
+    echo "=> 启动命令预览:"
+    echo "   java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar $APP_JAR"
+    echo ""
+    
+    # 统一的JAR启动命令
+    nohup java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar "$APP_JAR" >> "$LOG_FILE" 2>&1 &
     local java_pid=$!
     echo $java_pid > "$PID_FILE"
     
@@ -401,7 +604,7 @@ start() {
     sleep 2
     if ! kill -0 $java_pid 2>/dev/null; then
         echo "=> $APP_NAME 实例 '$instance_name' 进程启动失败"
-        rm -f "$PID_FILE"
+        cleanup_pid_file "$instance_name" "$PID_FILE"
         echo "=> 请检查日志: $LOG_FILE"
         return 1
     fi
@@ -469,6 +672,74 @@ start_all() {
     fi
 }
 
+# 尝试通过Spring Boot Actuator shutdown端点优雅关闭应用
+try_actuator_shutdown() {
+    local instance_name="$1"
+    local pid="$2"
+    
+    if [ "$ENABLE_ACTUATOR_SHUTDOWN" != "true" ]; then
+        return 1  # 未启用Actuator shutdown
+    fi
+    
+    # 检查curl是否可用
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "   - 警告: curl 不可用，跳过 Actuator shutdown"
+        return 1
+    fi
+    
+    echo "   - 尝试通过 Actuator shutdown 端点优雅关闭..."
+    
+    # 尝试调用shutdown端点
+    local shutdown_url="http://localhost:${ACTUATOR_SHUTDOWN_PORT}/actuator/shutdown"
+    local response
+    
+    if response=$(curl -s -X POST "$shutdown_url" -H "Content-Type: application/json" --connect-timeout "$ACTUATOR_SHUTDOWN_TIMEOUT" 2>/dev/null); then
+        echo "   - Actuator shutdown 请求已发送: $response"
+        
+        # 等待应用响应shutdown请求
+        local wait_count=0
+        while [ $wait_count -lt "$ACTUATOR_SHUTDOWN_TIMEOUT" ]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "   - 应用已通过 Actuator shutdown 优雅关闭"
+                return 0
+            fi
+            sleep 1
+            wait_count=$((wait_count + 1))
+        done
+        
+        echo "   - Actuator shutdown 超时，继续使用信号方式"
+    else
+        echo "   - Actuator shutdown 请求失败，继续使用信号方式"
+    fi
+    
+    return 1
+}
+
+# 等待进程终止（带超时）
+wait_for_process_termination() {
+    local pid="$1"
+    local timeout="$2"
+    local signal_name="$3"
+    
+    local wait_count=0
+    while [ $wait_count -lt "$timeout" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "   - 进程已响应 $signal_name 信号并终止 (等待时间: ${wait_count}秒)"
+            return 0
+        fi
+        sleep 1
+        wait_count=$((wait_count + 1))
+        
+        # 每5秒显示一次等待状态
+        if [ $((wait_count % 5)) -eq 0 ]; then
+            echo "   - 等待进程响应 $signal_name 信号... (${wait_count}/${timeout}秒)"
+        fi
+    done
+    
+    echo "   - 等待 $signal_name 信号超时 (${timeout}秒)"
+    return 1
+}
+
 # 停止单个应用实例
 stop() {
     local instance_name="$1"
@@ -478,31 +749,67 @@ stop() {
         return 1
     fi
     
+    # 加载优雅停止配置
+    load_shutdown_config
+    
     pid=$(check_pid)
     if [ -z "$pid" ]; then
         echo "=> $APP_NAME 实例 '$instance_name' 未运行"
         return 0
     fi
     
-    echo "=> 正在停止 $APP_NAME 实例 '$instance_name' (pid: $pid)..."
-    kill $pid
+    echo "=> 正在优雅停止 $APP_NAME 实例 '$instance_name' (pid: $pid)..."
+    echo "=> 停止策略: Actuator shutdown → SIGTERM → SIGINT → SIGKILL"
     
-    # 等待进程终止
-    for ((i=1; i<=30; i++)); do
-        if ! kill -0 $pid 2>/dev/null; then
-            rm -f "$PID_FILE"
+    # 第一步: 尝试通过 Actuator shutdown 端点优雅关闭
+    if try_actuator_shutdown "$instance_name" "$pid"; then
+        cleanup_pid_file "$instance_name" "$PID_FILE"
+        echo "=> $APP_NAME 实例 '$instance_name' 已通过 Actuator 优雅停止"
+        return 0
+    fi
+    
+    # 第二步: 发送 SIGTERM 信号进行优雅关闭
+    echo "=> 发送 SIGTERM 信号进行优雅关闭..."
+    if kill -TERM "$pid" 2>/dev/null; then
+        if wait_for_process_termination "$pid" "$GRACEFUL_SHUTDOWN_TIMEOUT" "SIGTERM"; then
+            cleanup_pid_file "$instance_name" "$PID_FILE"
+            echo "=> $APP_NAME 实例 '$instance_name' 已优雅停止"
+            return 0
+        fi
+    else
+        echo "   - 发送 SIGTERM 信号失败"
+    fi
+    
+    # 第三步: 发送 SIGINT 信号（Ctrl+C）
+    echo "=> 发送 SIGINT 信号..."
+    if kill -INT "$pid" 2>/dev/null; then
+        if wait_for_process_termination "$pid" "$FORCE_KILL_TIMEOUT" "SIGINT"; then
+            cleanup_pid_file "$instance_name" "$PID_FILE"
             echo "=> $APP_NAME 实例 '$instance_name' 已停止"
             return 0
         fi
-        sleep 1
-    done
+    else
+        echo "   - 发送 SIGINT 信号失败"
+    fi
     
-    # 如果进程仍然存在，使用强制终止
-    echo "=> $APP_NAME 实例 '$instance_name' 未能正常停止，正在强制终止..."
-    kill -9 $pid
-    rm -f "$PID_FILE"
-    echo "=> $APP_NAME 实例 '$instance_name' 已被强制停止"
-    return 0
+    # 第四步: 使用 SIGKILL 强制终止
+    echo "=> 优雅关闭失败，使用 SIGKILL 强制终止..."
+    if kill -KILL "$pid" 2>/dev/null; then
+        # SIGKILL 无法被忽略，但仍需等待系统清理
+        sleep 2
+        if ! kill -0 "$pid" 2>/dev/null; then
+            cleanup_pid_file "$instance_name" "$PID_FILE"
+            echo "=> $APP_NAME 实例 '$instance_name' 已被强制停止"
+            return 0
+        else
+            echo "=> 警告: 进程 $pid 可能处于不可中断状态"
+            cleanup_pid_file "$instance_name" "$PID_FILE"
+            return 1
+        fi
+    else
+        echo "=> 错误: 无法终止进程 $pid"
+        return 1
+    fi
 }
 
 # 停止所有实例（按配置文件顺序）

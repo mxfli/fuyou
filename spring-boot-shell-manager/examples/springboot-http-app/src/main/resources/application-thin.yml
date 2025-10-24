@@ -1,0 +1,53 @@
+# Thin JAR 模式配置示例
+# 此配置文件将被复制到 appconfig/ 目录
+
+server:
+  port: 8080
+  servlet:
+    context-path: /
+
+spring:
+  application:
+    name: springboot-http-app-thin
+  
+  profiles:
+    active: thin
+  
+  # 日志配置
+  logging:
+    config: classpath:logback-spring.xml
+    level:
+      com.example: INFO
+      org.springframework: WARN
+      root: INFO
+
+# 应用特定配置
+app:
+  name: "Spring Boot Thin JAR Demo"
+  version: "@project.version@"
+  description: "演示 Thin JAR 模式的 Spring Boot 应用"
+  
+  # 功能开关
+  features:
+    health-check: true
+    metrics: true
+    shutdown-endpoint: true
+
+# 管理端点配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,shutdown
+      base-path: /actuator
+  endpoint:
+    shutdown:
+      enabled: true
+    health:
+      show-details: always
+
+# 自定义属性（可在运行时通过外部配置覆盖）
+custom:
+  message: "Hello from Thin JAR!"
+  timeout: 30000
+  retry-count: 3

@@ -1,0 +1,61 @@
+# Spring Boot 测试应用配置
+server:
+  port: 8801
+  servlet:
+    context-path: /
+  shutdown: graceful
+
+spring:
+  application:
+    name: springboot-http-app
+  profiles:
+    active: thin
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+# Actuator 配置 - 启用健康检查和优雅停止
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,shutdown,metrics
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+    shutdown:
+      enabled: true
+  server:
+    port: 8801
+
+# 日志配置
+logging:
+  level:
+    root: INFO
+    com.example.demo: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+  file:
+    name: logs/application.log
+    max-size: 10MB
+    max-history: 30
+
+# 应用信息
+info:
+  app:
+    name: Spring Boot HTTP Test App
+    description: Test application for startup.sh script
+    version: 1.0.0
+    port: 8801
+  build:
+    artifact: springboot-http-app
+    group: com.example
+  test:
+    purpose: "测试 startup.sh 脚本的各项功能"
+    features:
+      - "启动检测"
+      - "健康检查"
+      - "优雅停止"
+      - "进程管理"
+      - "日志输出"
