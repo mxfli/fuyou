@@ -60,11 +60,12 @@ detect_jar_files() {
     print_info "正在检测JAR文件..."
     print_info "搜索目录: $APP_HOME"
     
-    # 在应用根目录查找JAR文件
-    # 使用通配符在当前目录查找JAR文件，仅匹配一层
+    # 在应用根目录查找JAR文件，按修改时间倒序排列（最新的在前）
     while IFS= read -r -d '' jar_file; do
         jar_files+=("$jar_file")
-    done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f -print0 2>/dev/null)
+    done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f -printf '%T@ %p\0' 2>/dev/null | \
+             sort -rz -n | \
+             cut -z -d' ' -f2-)
     
     if [ ${#jar_files[@]} -eq 0 ]; then
         print_warning "未在 $APP_HOME 目录中找到JAR文件"
@@ -72,7 +73,7 @@ detect_jar_files() {
         return 1
     fi
     
-    print_success "检测到 ${#jar_files[@]} 个JAR文件"
+    print_success "检测到 ${#jar_files[@]} 个JAR文件 (按修改时间倒序排列)"
     
     # 更新全局数组
     DETECTED_JAR_FILES=("${jar_files[@]}")
