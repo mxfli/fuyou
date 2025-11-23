@@ -60,11 +60,26 @@ detect_jar_files() {
     print_info "正在检测JAR文件..."
     print_info "搜索目录: $APP_HOME"
     
-    # 在应用根目录查找JAR文件
-    # 使用通配符在当前目录查找JAR文件，仅匹配一层
-    while IFS= read -r -d '' jar_file; do
-        jar_files+=("$jar_file")
-    done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f -print0 2>/dev/null)
+    # 在应用根目录查找JAR文件，按修改时间倒序排列（最新的在前）
+    # 使用兼容性更好的方法处理文件排序
+    if command -v stat >/dev/null 2>&1; then
+        # 使用 stat 命令获取修改时间，兼容性更好
+        while IFS= read -r jar_file; do
+            if [ -n "$jar_file" ]; then
+                jar_files+=("$jar_file")
+            fi
+        done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f -exec stat -c '%Y %n' {} \; 2>/dev/null | \
+                 sort -rn | \
+                 cut -d' ' -f2-)
+    else
+        # 备用方案：使用 ls 命令按时间排序
+        while IFS= read -r jar_file; do
+            if [ -n "$jar_file" ]; then
+                jar_files+=("$jar_file")
+            fi
+        done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f -print0 2>/dev/null | \
+                 xargs -0 ls -1t 2>/dev/null)
+    fi
     
     if [ ${#jar_files[@]} -eq 0 ]; then
         print_warning "未在 $APP_HOME 目录中找到JAR文件"
@@ -72,7 +87,7 @@ detect_jar_files() {
         return 1
     fi
     
-    print_success "检测到 ${#jar_files[@]} 个JAR文件"
+    print_success "检测到 ${#jar_files[@]} 个JAR文件 (按修改时间倒序排列)"
     
     # 更新全局数组
     DETECTED_JAR_FILES=("${jar_files[@]}")
