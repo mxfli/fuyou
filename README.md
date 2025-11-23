@@ -4,7 +4,28 @@
 
 ## 版本发布
 
-### v0.3.0 (最新)
+### v0.4.0 (最新)
+
+- **本地部署自动化**: 新增 `deploy.sh` 脚本，支持 Spring Boot 应用的自动化构建和本地同步部署
+  - 支持三种配置方式：IDE 环境变量、`.fuyou` 配置文件、脚本硬编码
+  - 交互式初始化部署目录（`--init` 参数），自动生成 `.fuyou` 配置文件
+  - 智能部署目录验证，确保目录有效性和安全性
+  - 自动 Maven 构建和文件同步（appconfig、lib、JAR 版本管理）
+  - 支持多子项目独立配置，每个项目维护独立的部署配置
+
+- **CSV 文件智能分割工具**: 新增 `csv_file_splitter.sh` 大文件分割工具
+  - 按 100 万行数据自动分割大型 CSV 文件
+  - 智能保留标题行，每个子文件包含完整表头
+  - 支持单文件和批量处理两种模式
+  - 自动检测文件大小，避免不必要的处理
+  - 流式处理优化内存使用，支持超大文件处理
+
+- **配置向导优化**: 升级 `setup.sh` JAR 文件检测逻辑
+  - JAR 文件按修改时间倒序排列，最新构建的 JAR 优先显示
+  - 改进文件检测兼容性，支持 `stat` 和 `ls` 两种排序方式
+  - 优化用户提示信息，明确显示文件排序规则
+
+### v0.3.0
 
 - **交互式配置向导**: 新增 `setup.sh` 智能配置向导，一键完成应用部署配置
 - **JAR类型自动识别**: 智能检测 Fat JAR 和 Thin JAR，自动选择最优启动方式
@@ -55,7 +76,7 @@
 
 ### Spring Boot 应用启动管理器
 
-一个智能的 Spring Boot 应用部署和管理工具，提供从配置到运行的完整解决方案：
+一个智能的 Spring Boot 应用部署和管理工具，提供从配置、构建、部署到运行的完整解决方案：
 
 #### 🎯 智能配置 (`setup.sh`)
 
@@ -65,6 +86,17 @@
 - **Spring Profile智能选择**: 检测配置文件，推荐合适的 Profile
 - **JVM参数配置**: 交互式内存配置，适配不同环境需求
 - **环境变量隔离**: 不使用 export，避免污染系统环境
+- **智能文件排序**: JAR 文件按修改时间倒序显示，最新构建优先
+
+#### 📦 本地部署 (`deploy.sh`)
+
+- **自动化构建部署**: Maven 自动构建 + 文件同步一键完成
+- **灵活配置方式**: 支持环境变量、配置文件、脚本硬编码三种配置
+- **交互式初始化**: 通过 `--init` 参数快速创建 `.fuyou` 配置文件
+- **智能目录验证**: 自动检查部署目录有效性和安全性
+- **版本自动管理**: 智能清理旧版本 JAR，保持部署目录整洁
+- **多项目支持**: 支持多子项目独立配置，互不干扰
+- **详细执行日志**: 实时显示配置来源、部署目录和执行进度
 
 #### 🚀 启动管理 (`startup.sh`)
 - **Spring Boot启动检查**: 通过检查日志中的`Started.*in.*seconds`关键字确认应用真正启动成功
@@ -97,7 +129,9 @@
 
 ## 🚀 快速开始
 
-### 1. 准备工作
+### Spring Boot 应用管理
+
+#### 1. 准备工作
 
 ```bash
 # 将 Spring Boot JAR 文件放到应用根目录
@@ -105,17 +139,33 @@ your-app/
 ├── your-app-1.0.0.jar              # 您的应用JAR
 └── spring-boot-shell-manager/      # 管理器目录
     ├── setup.sh                    # 配置向导
+    ├── deploy.sh                   # 本地部署脚本
     └── startup.sh                  # 启动脚本
 ```
 
-### 2. 运行配置向导
+#### 2. 运行配置向导
 
 ```bash
 cd spring-boot-shell-manager
 ./setup.sh
 ```
 
-### 3. 启动应用
+#### 3. 本地部署（可选）
+
+如果需要自动化构建和本地同步部署：
+
+```bash
+# 初始化部署配置
+./deploy.sh --init /path/to/deploy/directory
+
+# 执行部署（Maven 构建 + 文件同步）
+./deploy.sh
+
+# 或通过 IDE 环境变量临时指定
+DEPLOY_DIR=/path/to/deploy ./deploy.sh
+```
+
+#### 4. 启动应用
 
 ```bash
 # 启动应用
@@ -130,6 +180,13 @@ cd spring-boot-shell-manager
 
 ## 📚 文档
 
+### Spring Boot 管理器
+
 - **[使用手册](spring-boot-shell-manager/MANUAL.md)** - 详细的使用说明和参考文档
+- **[部署指南](spring-boot-shell-manager/DEPLOY.md)** - 本地部署脚本完整使用指南
 - **[README](spring-boot-shell-manager/README.md)** - 功能介绍和配置说明
 - **[示例项目](spring-boot-shell-manager/examples/)** - 完整的使用示例
+
+### 工具文档
+
+- **[CSV 分割工具](csv-fie-splitter/)** - CSV 大文件分割工具说明
