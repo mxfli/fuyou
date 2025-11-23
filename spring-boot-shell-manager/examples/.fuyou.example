@@ -1,0 +1,14 @@
+# Spring Boot 本地部署配置示例
+# 
+# 使用方法：
+#   1. 复制此文件到项目根目录并重命名为 .fuyou
+#   2. 修改 DEPLOY_DIR 为实际的部署目录
+#   3. 或者直接使用 deploy.sh --init 命令自动生成
+#
+# 注意：
+#   - 部署目录必须使用绝对路径
+#   - 部署目录必须已存在
+#   - 建议将 .fuyou 加入 .gitignore
+
+# 部署目标目录（必须是绝对路径）
+DEPLOY_DIR="/path/to/your/deploy/directory"

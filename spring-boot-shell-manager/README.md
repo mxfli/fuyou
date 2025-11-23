@@ -1,6 +1,7 @@
 # Spring Boot 应用启动管理器
 
-一个智能的 Spring Boot 应用部署和管理工具，支持 **Fat JAR** 和 **Thin JAR** 自动识别，支持**多实例部署**，提供**交互式配置向导**。
+一个智能的 Spring Boot 应用部署和管理工具，支持 **Fat JAR** 和 **Thin JAR** 自动识别，支持**多实例部署**，提供**交互式配置向导**和**本地自动化部署
+**。
 
 ## ✨ 核心特性
 
@@ -10,27 +11,102 @@
 - 🛡️ **环境隔离**: 配置变量作用域限制，避免污染系统环境
 - 📊 **Spring Profile智能选择**: 自动检测配置文件，智能推荐Profile
 - 💾 **JVM参数优化**: 交互式JVM内存配置，适配不同环境需求
+- 📦 **本地自动化部署**: 支持 Maven 构建和本地目录同步部署
 
 ## 🚀 快速开始
 
 ### 1. 准备工作
 
-将 Spring Boot JAR 文件放到应用根目录，然后进入管理器目录：
+将管理器脚本放到 Spring Boot 项目中：
 
 ```bash
 # 目录结构示例
-your-app/
-├── your-app-1.0.0.jar              # 您的应用JAR
-└── bin/      # 管理器目录
+your-app/                           # Spring Boot 项目根目录
+├── pom.xml                         # Maven 配置
+├── src/                            # 源代码
+└── spring-boot-shell-manager/      # 管理器目录
+    ├── deploy.sh                   # 本地部署脚本 ⭐
     ├── setup.sh                    # 配置向导 ⭐
     └── startup.sh                  # 启动脚本 ⭐
 ```
 
-### 2. 运行配置向导
+### 2. 本地自动化部署（可选）
+
+如果需要将构建产物部署到本地指定目录，可以使用 `deploy.sh` 脚本。
+
+> 📖 **详细文档**: [DEPLOY.md](DEPLOY.md) - 完整的部署脚本使用指南
+
+**使用说明：**
+
+- 将 `deploy.sh` 复制到项目根目录（与 `pom.xml` 同级）
+- `.fuyou` 配置文件会自动创建在项目根目录
+- 多个子项目可以各自拥有独立的配置
+
+#### 2.1 初始化部署配置
 
 ```bash
-# pwd your-app
-.bin/setup.sh
+# 将 deploy.sh 复制到项目根目录
+cp spring-boot-shell-manager/deploy.sh ./
+
+# 设置部署目录（目录必须已存在）
+./deploy.sh --init /path/to/deploy
+```
+
+这会在项目根目录创建 `.fuyou` 配置文件，保存部署路径。
+
+#### 2.2 执行部署
+
+```bash
+# 方式1: 使用配置文件（推荐）
+./deploy.sh
+
+# 方式2: 使用 IDE 环境变量
+DEPLOY_DIR=/path/to/deploy ./deploy.sh
+
+# 方式3: 通过 IDE 配置环境变量后直接运行
+# 在 IDE 的 Run Configuration 中设置 DEPLOY_DIR 环境变量
+./deploy.sh
+```
+
+**部署脚本会自动完成：**
+
+- ✅ Maven 构建（`mvn clean compile package -DskipTests`）
+- ✅ 同步 `appconfig/` 目录到部署目录
+- ✅ 同步 `lib/` 目录到部署目录
+- ✅ 清理旧版本 JAR，复制新版本 JAR
+
+#### 2.3 查看帮助
+
+```bash
+./deploy.sh --help
+```
+
+#### 2.4 多项目使用
+
+每个 Spring Boot 项目可以有自己的 `deploy.sh` 和 `.fuyou` 配置：
+
+```bash
+# 项目A
+cd project-a
+cp ../spring-boot-shell-manager/deploy.sh ./
+./deploy.sh --init /deploy/app-a
+./deploy.sh
+
+# 项目B
+cd ../project-b
+cp ../spring-boot-shell-manager/deploy.sh ./
+./deploy.sh --init /deploy/app-b
+./deploy.sh
+```
+
+### 3. 运行配置向导
+
+```bash
+# 进入部署目录（假设已通过 deploy.sh 部署）
+cd /path/to/deploy
+
+# 运行配置向导
+./spring-boot-shell-manager/setup.sh
 ```
 
 **配置向导将引导您完成：**
@@ -91,7 +167,7 @@ your-app/
 ./startup.sh logs
 ```
 
-### 4. 多实例管理
+### 5. 多实例管理
 
 多实例部署时的管理命令：
 
@@ -112,18 +188,43 @@ your-app/
 
 ## 📁 目录结构
 
-配置完成后的目录结构：
+### 开发阶段目录结构
 
 ```
-your-app/
+your-spring-boot-project/           # Spring Boot 项目根目录
+├── pom.xml                         # Maven 配置
+├── src/                            # 源代码
+├── target/                         # Maven 构建输出
+│   ├── your-app-1.0.0.jar          # 构建的JAR
+│   ├── lib/                        # 依赖库（Thin JAR）
+│   └── appconfig/                  # 配置文件
+├── deploy.sh                       # 部署脚本（从 spring-boot-shell-manager 复制）
+├── .fuyou                          # 部署配置（deploy.sh --init 自动生成）
+└── spring-boot-shell-manager/      # 管理器脚本目录（可选，用于运行时管理）
+    ├── setup.sh                    # 配置向导
+    └── startup.sh                  # 启动脚本
+```
+
+**说明：**
+
+- `deploy.sh` 放在项目根目录，方便执行
+- `.fuyou` 在项目根目录，与 `deploy.sh` 同级
+- 建议将 `.fuyou` 加入 `.gitignore`（每个开发者独立配置）
+
+### 部署后的目录结构
+
+```
+/path/to/deploy/                    # 部署目标目录
 ├── your-app-1.0.0.jar              # Spring Boot应用
+├── lib/                            # 依赖库（Thin JAR模式）
+├── appconfig/                      # 应用配置文件
 ├── servers.properties              # 多实例配置（多实例时生成）
 ├── spring-boot-shell-manager/      # 启动管理器
 │   ├── setup.sh                    # 配置向导
 │   ├── startup.sh                  # 启动脚本
-│   ├── set-env.sh                  # 环境配置（自动生成）
-│   ├── jvm-env.sh                  # JVM参数（自动生成）
-│   └── shutdown-env.sh             # 优雅停止配置（自动生成）
+│   ├── set-env.sh                  # 环境配置（setup.sh 生成）
+│   ├── jvm-env.sh                  # JVM参数（setup.sh 生成）
+│   └── shutdown-env.sh             # 优雅停止配置（setup.sh 生成）
 ├── instance-8080/                  # 实例1（多实例时）
 │   ├── logs/                       # 日志目录
 │   │   ├── your-app.out            # 控制台日志
@@ -137,7 +238,23 @@ your-app/
 
 ## ⚙️ 配置文件说明
 
-### set-env.sh - 应用环境配置
+### .fuyou - 部署配置（项目根目录）
+
+```bash
+# Spring Boot 本地部署配置
+# 由 deploy.sh --init 自动生成
+
+# 部署目标目录（必须是绝对路径）
+DEPLOY_DIR="/path/to/deploy"
+```
+
+**说明：**
+
+- 该文件在项目根目录，用于配置本地部署路径
+- 通过 `deploy.sh --init` 命令创建
+- 可以加入 `.gitignore`，每个开发者维护自己的配置
+
+### set-env.sh - 应用环境配置（部署目录）
 
 ```bash
 # 注意：变量仅在脚本作用域内有效，不污染全局环境
@@ -294,8 +411,39 @@ java -jar ../your-app.jar --spring.config.location=instance-8080/appconfig/ --sp
 
 ## 🎯 最佳实践
 
+### 开发阶段
+
+1. **本地部署**: 使用 `deploy.sh --init` 配置本地部署目录
+2. **快速迭代**: 修改代码后直接运行 `deploy.sh` 自动构建部署
+3. **IDE 集成**: 在 IDE 中配置 External Tool，一键执行 `deploy.sh`
+4. **配置隔离**: `.fuyou` 文件加入 `.gitignore`，每个开发者独立配置
+
+### 运行环境
+
 1. **开发环境**: 使用单实例模式，较小内存配置
 2. **测试环境**: 使用多实例模式，模拟生产环境
 3. **生产环境**: 根据负载配置实例数量和内存大小
 4. **监控**: 配置应用监控和日志收集
 5. **备份**: 定期备份配置文件和应用数据
+
+### 工作流程示例
+
+```bash
+# 1. 首次使用：初始化部署配置
+cd your-spring-boot-project
+./spring-boot-shell-manager/deploy.sh --init ~/deploy/my-app
+
+# 2. 开发过程：修改代码后自动部署
+# 修改代码...
+./spring-boot-shell-manager/deploy.sh
+
+# 3. 配置运行环境
+cd ~/deploy/my-app
+./spring-boot-shell-manager/setup.sh
+
+# 4. 启动应用
+./spring-boot-shell-manager/startup.sh start
+
+# 5. 查看日志
+./spring-boot-shell-manager/startup.sh logs
+```
