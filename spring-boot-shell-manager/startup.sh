@@ -22,6 +22,17 @@ APP_NAME="${APP_NAME:-springboot-http-app}"
 APP_VERSION="${APP_VERSION:-}"
 SERVERS_CONFIG="${APP_HOME}/servers.properties"
 
+# 配置缓存（避免重复解析）
+_SERVERS_CONFIG_CACHE_TIMESTAMP=0
+_SERVERS_CONFIG_CACHE_KEYS=()
+_SERVERS_CONFIG_CACHE_DIRS=()
+
+# JAR 类型检测缓存
+_JAR_TYPE_CACHE=""
+_JAR_MAIN_CLASS_CACHE=""
+_JAR_FILE_CACHE=""
+_JAR_FILE_MTIME_CACHE=""
+
 # 应用JAR和主类将通过智能检测确定
 APP_JAR=""
 JAR_TYPE=""
@@ -30,6 +41,29 @@ MAIN_CLASS=""
 # 脚本的参数
 MAX_WAIT_TIME=60  # 最大等待时间60秒
 CHECK_INTERVAL=2  # 每2秒检查一次
+
+# 基础日志函数
+log_info() {
+    echo "=> $*"
+}
+
+log_warn() {
+    echo "=> 警告: $*"
+}
+
+log_error() {
+    echo "=> 错误: $*"
+}
+
+# 获取文件修改时间（兼容 macOS/Linux）
+get_file_mtime() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
 
 # 检测JAR文件和类型
 detect_jar_file_and_type() {
@@ -61,23 +95,38 @@ detect_jar_file_and_type() {
 # 检测JAR类型并设置主类
 detect_jar_type_and_main_class() {
     if [ ! -f "$APP_JAR" ]; then
-        echo "=> 错误: 应用JAR文件不存在: $APP_JAR"
+        log_error "应用JAR文件不存在: $APP_JAR"
         return 1
+    fi
+
+    local current_mtime
+    current_mtime=$(get_file_mtime "$APP_JAR")
+    if [ -n "$_JAR_TYPE_CACHE" ] && [ "$APP_JAR" = "$_JAR_FILE_CACHE" ] && [ "$current_mtime" = "$_JAR_FILE_MTIME_CACHE" ]; then
+        JAR_TYPE="$_JAR_TYPE_CACHE"
+        MAIN_CLASS="$_JAR_MAIN_CLASS_CACHE"
+        log_info "JAR 类型(缓存): $JAR_TYPE, 主类: $MAIN_CLASS"
+        return 0
     fi
     
     # 检查是否为 Fat JAR（包含 BOOT-INF 目录）
     if jar tf "$APP_JAR" | grep -q "^BOOT-INF/"; then
-        echo "=> 检测到 Fat JAR 模式"
+        log_info "检测到 Fat JAR 模式"
         MAIN_CLASS="org.springframework.boot.loader.JarLauncher"
         JAR_TYPE="fat"
     else
-        echo "=> 检测到 Thin JAR 模式"
+        log_info "检测到 Thin JAR 模式"
         # Thin JAR 使用 -jar 启动，主类由 MANIFEST.MF 指定
         MAIN_CLASS="(由MANIFEST.MF指定)"
         JAR_TYPE="thin"
     fi
-    
-    echo "=> JAR 类型: $JAR_TYPE, 主类: $MAIN_CLASS"
+
+    # 更新缓存
+    _JAR_TYPE_CACHE="$JAR_TYPE"
+    _JAR_MAIN_CLASS_CACHE="$MAIN_CLASS"
+    _JAR_FILE_CACHE="$APP_JAR"
+    _JAR_FILE_MTIME_CACHE="$current_mtime"
+
+    log_info "JAR 类型: $JAR_TYPE, 主类: $MAIN_CLASS"
     return 0
 }
 
@@ -123,6 +172,16 @@ read_servers_ordered() {
     SERVER_KEYS=()
     SERVER_DIRS=()
 
+    local current_mtime
+    current_mtime=$(get_file_mtime "$SERVERS_CONFIG")
+
+    # 如果缓存有效，直接使用缓存
+    if [ "$current_mtime" -eq "$_SERVERS_CONFIG_CACHE_TIMESTAMP" ] && [ ${#_SERVERS_CONFIG_CACHE_KEYS[@]} -gt 0 ]; then
+        SERVER_KEYS=("${_SERVERS_CONFIG_CACHE_KEYS[@]}")
+        SERVER_DIRS=("${_SERVERS_CONFIG_CACHE_DIRS[@]}")
+        return 0
+    fi
+
     if [ -f "$SERVERS_CONFIG" ]; then
         while IFS='=' read -r key value; do
             # 跳过空行和注释
@@ -149,6 +208,11 @@ read_servers_ordered() {
         SERVER_KEYS=("server")
         SERVER_DIRS=("")
     fi
+
+    # 更新缓存
+    _SERVERS_CONFIG_CACHE_TIMESTAMP="$current_mtime"
+    _SERVERS_CONFIG_CACHE_KEYS=("${SERVER_KEYS[@]}")
+    _SERVERS_CONFIG_CACHE_DIRS=("${SERVER_DIRS[@]}")
 }
 
 # 获取实例配置（通过有序解析，避免重复读取配置）
@@ -409,64 +473,41 @@ load_jvm_tunables() {
 
 # 构建不同 JDK 版本的推荐 JVM 参数
 build_java_opts_for_version() {
-    echo "=> 开始 Java 环境检测..."
+    log_info "开始 Java 环境检测..."
     
     if ! detect_java_major_version; then
-        echo "=> 错误: Java 版本检测失败，无法继续启动"
+        log_error "Java 版本检测失败，无法继续启动"
         return 1
     fi
     
     load_jvm_tunables
 
+    # 构建公共 JVM 参数
+    local COMMON_OPTS=""
+    COMMON_OPTS="$COMMON_OPTS -server"
+    COMMON_OPTS="$COMMON_OPTS -Xms${JVM_XMS} -Xmx${JVM_XMX}"
+    COMMON_OPTS="$COMMON_OPTS -XX:MetaspaceSize=${JVM_METASPACE_SIZE} -XX:MaxMetaspaceSize=${JVM_MAX_METASPACE_SIZE}"
+    COMMON_OPTS="$COMMON_OPTS -XX:+UseG1GC -XX:MaxGCPauseMillis=${JVM_MAX_GC_PAUSE_MS} -XX:InitiatingHeapOccupancyPercent=${JVM_IHOP}"
+    COMMON_OPTS="$COMMON_OPTS -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication"
+    COMMON_OPTS="$COMMON_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${JVM_HEAP_DUMP_PATH} -XX:ErrorFile=${JVM_ERROR_FILE}"
+    if [ -n "$JVM_THREAD_STACK_SIZE" ]; then
+        COMMON_OPTS="$COMMON_OPTS -Xss${JVM_THREAD_STACK_SIZE}"
+    fi
+
     # 各版本按需构建参数
     case "$JAVA_MAJOR_VERSION" in
         8)
             # JDK 8: 使用 Metaspace（PermGen 在 JDK 8 中已移除）+ 旧式 GC 日志
-            local JDK8_OPTS=""
-            JDK8_OPTS="$JDK8_OPTS -server"
-            JDK8_OPTS="$JDK8_OPTS -Xms${JVM_XMS} -Xmx${JVM_XMX}"
-            JDK8_OPTS="$JDK8_OPTS -XX:MetaspaceSize=${JVM_METASPACE_SIZE} -XX:MaxMetaspaceSize=${JVM_MAX_METASPACE_SIZE}"
-            JDK8_OPTS="$JDK8_OPTS -XX:+UseG1GC -XX:MaxGCPauseMillis=${JVM_MAX_GC_PAUSE_MS} -XX:InitiatingHeapOccupancyPercent=${JVM_IHOP}"
-            JDK8_OPTS="$JDK8_OPTS -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication"
-            JDK8_OPTS="$JDK8_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${JVM_HEAP_DUMP_PATH} -XX:ErrorFile=${JVM_ERROR_FILE}"
-            if [ -n "$JVM_THREAD_STACK_SIZE" ]; then
-                JDK8_OPTS="$JDK8_OPTS -Xss${JVM_THREAD_STACK_SIZE}"
-            fi
-            # JDK 8 GC 日志（旧式）
-            JDK8_OPTS="$JDK8_OPTS -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:${LOG_DIR}/gc.log"
-            JDK8_OPTS="$JDK8_OPTS -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=${JVM_GC_LOG_FILECOUNT} -XX:GCLogFileSize=${JVM_GC_LOG_FILESIZE}"
-            JAVA_VERSION_OPTS="$JDK8_OPTS"
+            JAVA_VERSION_OPTS="$COMMON_OPTS -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:${LOG_DIR}/gc.log"
+            JAVA_VERSION_OPTS="$JAVA_VERSION_OPTS -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=${JVM_GC_LOG_FILECOUNT} -XX:GCLogFileSize=${JVM_GC_LOG_FILESIZE}"
             ;;
         11|17|21|25)
             # JDK 11/17/21/25: 使用 Metaspace + 新式 -Xlog GC 日志
-            local MODERN_OPTS=""
-            MODERN_OPTS="$MODERN_OPTS -server"
-            MODERN_OPTS="$MODERN_OPTS -Xms${JVM_XMS} -Xmx${JVM_XMX}"
-            MODERN_OPTS="$MODERN_OPTS -XX:MetaspaceSize=${JVM_METASPACE_SIZE} -XX:MaxMetaspaceSize=${JVM_MAX_METASPACE_SIZE}"
-            MODERN_OPTS="$MODERN_OPTS -XX:+UseG1GC -XX:MaxGCPauseMillis=${JVM_MAX_GC_PAUSE_MS} -XX:InitiatingHeapOccupancyPercent=${JVM_IHOP}"
-            MODERN_OPTS="$MODERN_OPTS -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication"
-            MODERN_OPTS="$MODERN_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${JVM_HEAP_DUMP_PATH} -XX:ErrorFile=${JVM_ERROR_FILE}"
-            if [ -n "$JVM_THREAD_STACK_SIZE" ]; then
-                MODERN_OPTS="$MODERN_OPTS -Xss${JVM_THREAD_STACK_SIZE}"
-            fi
-            # JDK 11+ GC 日志（新式 -Xlog）
-            MODERN_OPTS="$MODERN_OPTS -Xlog:gc*,safepoint:file=${LOG_DIR}/gc.log:time,level,tags:filecount=${JVM_GC_LOG_FILECOUNT},filesize=${JVM_GC_LOG_FILESIZE}"
-            JAVA_VERSION_OPTS="$MODERN_OPTS"
+            JAVA_VERSION_OPTS="$COMMON_OPTS -Xlog:gc*,safepoint:file=${LOG_DIR}/gc.log:time,level,tags:filecount=${JVM_GC_LOG_FILECOUNT},filesize=${JVM_GC_LOG_FILESIZE}"
             ;;
         *)
             # 兜底：JDK 9/10 或未识别版本，使用现代参数集
-            local FALLBACK_OPTS=""
-            FALLBACK_OPTS="$FALLBACK_OPTS -server"
-            FALLBACK_OPTS="$FALLBACK_OPTS -Xms${JVM_XMS} -Xmx${JVM_XMX}"
-            FALLBACK_OPTS="$FALLBACK_OPTS -XX:MetaspaceSize=${JVM_METASPACE_SIZE} -XX:MaxMetaspaceSize=${JVM_MAX_METASPACE_SIZE}"
-            FALLBACK_OPTS="$FALLBACK_OPTS -XX:+UseG1GC -XX:MaxGCPauseMillis=${JVM_MAX_GC_PAUSE_MS} -XX:InitiatingHeapOccupancyPercent=${JVM_IHOP}"
-            FALLBACK_OPTS="$FALLBACK_OPTS -XX:+ParallelRefProcEnabled -XX:+UseStringDeduplication"
-            FALLBACK_OPTS="$FALLBACK_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${JVM_HEAP_DUMP_PATH} -XX:ErrorFile=${JVM_ERROR_FILE}"
-            if [ -n "$JVM_THREAD_STACK_SIZE" ]; then
-                FALLBACK_OPTS="$FALLBACK_OPTS -Xss${JVM_THREAD_STACK_SIZE}"
-            fi
-            FALLBACK_OPTS="$FALLBACK_OPTS -Xlog:gc*,safepoint:file=${LOG_DIR}/gc.log:time,level,tags:filecount=${JVM_GC_LOG_FILECOUNT},filesize=${JVM_GC_LOG_FILESIZE}"
-            JAVA_VERSION_OPTS="$FALLBACK_OPTS"
+            JAVA_VERSION_OPTS="$COMMON_OPTS -Xlog:gc*,safepoint:file=${LOG_DIR}/gc.log:time,level,tags:filecount=${JVM_GC_LOG_FILECOUNT},filesize=${JVM_GC_LOG_FILESIZE}"
             ;;
     esac
 
@@ -491,13 +532,45 @@ setup_java_opts() {
 
 # 检查应用是否运行
 check_pid() {
-    if [ -f "$PID_FILE" ]; then
-        local pid=$(cat "$PID_FILE")
-        if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
-            echo $pid
+    if [ ! -f "$PID_FILE" ]; then
+        echo ""
+        return 1
+    fi
+
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null)
+
+    if [ -z "$pid" ]; then
+        rm -f "$PID_FILE"
+        echo ""
+        return 1
+    fi
+
+    if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+        log_warn "PID文件包含无效内容: $pid"
+        rm -f "$PID_FILE"
+        echo ""
+        return 1
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        local cmdline
+        cmdline=$(ps -p "$pid" -o command= 2>/dev/null)
+        if [ -n "$APP_JAR" ] && [[ "$cmdline" =~ java.*"$APP_JAR" ]]; then
+            echo "$pid"
             return 0
         fi
+        if [ -z "$APP_JAR" ] && [[ "$cmdline" =~ java ]]; then
+            echo "$pid"
+            return 0
+        fi
+        log_warn "PID $pid 不是预期的 Java 进程"
+        rm -f "$PID_FILE"
+        echo ""
+        return 1
     fi
+
+    rm -f "$PID_FILE"
     echo ""
     return 1
 }
@@ -514,7 +587,7 @@ check_spring_boot_startup() {
     
     while [ $waited_time -lt $max_wait_time ]; do
         # 首先检查进程是否还存在
-        if ! kill -0 $java_pid 2>/dev/null; then
+        if ! kill -0 "$java_pid" 2>/dev/null; then
             echo "=> 警告: 进程 $java_pid 已停止"
             cleanup_pid_file "$instance_name" "$PID_FILE"
             return 1
@@ -549,18 +622,39 @@ check_spring_boot_startup() {
     done
     
     # 超时检查
-    echo "=> 超时: 等待${max_wait_time}秒后仍未检测到启动完成标识"
+    echo "=> 警告: 等待${max_wait_time}秒后仍未检测到启动完成标识"
     echo "=> 进程状态检查..."
     
-    if kill -0 $java_pid 2>/dev/null; then
+    if kill -0 "$java_pid" 2>/dev/null; then
         echo "=> 警告: 进程仍在运行但未检测到启动完成，可能启动异常"
         echo "=> 建议检查日志: $LOG_FILE 和 $LOG_DIR"
         return 1
     else
-        echo "=> 进程已停止，启动失败"
-        cleanup_pid_file "$instance_name" "$PID_FILE"
+        echo "=> 警告: 进程已停止，启动失败"
         return 1
     fi
+}
+
+# 构建 Java 启动命令数组（避免参数解析问题）
+build_java_cmd_array() {
+    JAVA_CMD=("java")
+
+    if [ -n "$JAVA_OPTS" ]; then
+        read -ra _java_opts <<< "$JAVA_OPTS"
+        JAVA_CMD+=("${_java_opts[@]}")
+    fi
+
+    if [ -n "$CONFIG_OPTS" ]; then
+        read -ra _config_opts <<< "$CONFIG_OPTS"
+        JAVA_CMD+=("${_config_opts[@]}")
+    fi
+
+    if [ -n "$LOADER_OPTS" ]; then
+        read -ra _loader_opts <<< "$LOADER_OPTS"
+        JAVA_CMD+=("${_loader_opts[@]}")
+    fi
+
+    JAVA_CMD+=("-jar" "$APP_JAR")
 }
 
 # 启动单个应用实例
@@ -592,17 +686,19 @@ start() {
     echo "=> JAR文件: $APP_JAR"
     echo "=> JAR类型: $JAR_TYPE"
     echo "=> 启动命令预览:"
-    echo "   java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar $APP_JAR"
+    build_java_cmd_array
+    printf "   %s " "${JAVA_CMD[@]}"
+    echo ""
     echo ""
     
     # 统一的JAR启动命令
-    nohup java $JAVA_OPTS $CONFIG_OPTS $LOADER_OPTS -jar "$APP_JAR" >> "$LOG_FILE" 2>&1 &
+    nohup "${JAVA_CMD[@]}" >> "$LOG_FILE" 2>&1 &
     local java_pid=$!
     echo $java_pid > "$PID_FILE"
     
     # 基础进程检查
     sleep 2
-    if ! kill -0 $java_pid 2>/dev/null; then
+    if ! kill -0 "$java_pid" 2>/dev/null; then
         echo "=> $APP_NAME 实例 '$instance_name' 进程启动失败"
         cleanup_pid_file "$instance_name" "$PID_FILE"
         echo "=> 请检查日志: $LOG_FILE"
