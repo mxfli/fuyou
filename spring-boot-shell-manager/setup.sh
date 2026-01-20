@@ -61,24 +61,40 @@ detect_jar_files() {
     print_info "搜索目录: $APP_HOME"
     
     # 在应用根目录查找JAR文件，按修改时间倒序排列（最新的在前）
-    # 使用兼容性更好的方法处理文件排序
+    # 兼容 GNU stat（Linux）与 BSD stat（macOS）
+    local stat_mode="ls"
     if command -v stat >/dev/null 2>&1; then
-        # 使用 stat 命令获取修改时间，兼容性更好
+        if stat --version >/dev/null 2>&1; then
+            stat_mode="gnu"
+        else
+            stat_mode="bsd"
+        fi
+    fi
+
+    if [ "$stat_mode" = "gnu" ]; then
+        # GNU stat: stat -c '%Y %n'
         while IFS= read -r jar_file; do
             if [ -n "$jar_file" ]; then
                 jar_files+=("$jar_file")
             fi
-        done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f -exec stat -c '%Y %n' {} \; 2>/dev/null | \
-                 sort -rn | \
-                 cut -d' ' -f2-)
+        done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f \
+            -exec stat -c '%Y %n' {} \; 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    elif [ "$stat_mode" = "bsd" ]; then
+        # BSD stat: stat -f '%m %N'
+        while IFS= read -r jar_file; do
+            if [ -n "$jar_file" ]; then
+                jar_files+=("$jar_file")
+            fi
+        done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f \
+            -exec stat -f '%m %N' {} \; 2>/dev/null | sort -rn | cut -d' ' -f2-)
     else
-        # 备用方案：使用 ls 命令按时间排序
+        # 备用方案：使用 ls 命令按时间排序（最后兜底）
         while IFS= read -r jar_file; do
             if [ -n "$jar_file" ]; then
                 jar_files+=("$jar_file")
             fi
         done < <(find "$APP_HOME" -maxdepth 1 -mindepth 1 -name "*.jar" -type f -print0 2>/dev/null | \
-                 xargs -0 ls -1t 2>/dev/null)
+            xargs -0 ls -1t 2>/dev/null)
     fi
     
     if [ ${#jar_files[@]} -eq 0 ]; then
@@ -730,7 +746,6 @@ generate_set_env() {
 
 # 添加Spring Profiles配置到set-env.sh
 add_spring_profiles_to_set_env() {
-    echo "=> 调试: SPRING_PROFILES_ACTIVE = '$SPRING_PROFILES_ACTIVE'"
     echo "# Spring Profiles 配置" >> "$SET_ENV_FILE"
     if [ -n "$SPRING_PROFILES_ACTIVE" ]; then
         echo "SPRING_PROFILES_ACTIVE=\"$SPRING_PROFILES_ACTIVE\"" >> "$SET_ENV_FILE"
