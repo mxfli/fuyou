@@ -1,0 +1,11 @@
+# Generated test files
+setup_bdd_test.exp
+
+# Test artifacts
+fixtures/
+fixtures_single/
+*.jar
+
+# Temp files
+*.tmp
+*.log
